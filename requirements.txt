@@ -1,0 +1,75 @@
+# Python dependencies for the synthetic-music-detection prototype.
+#
+#   pip install -r requirements.txt
+#
+# Verified working set on 2026-08-18: numpy 2.4.5, torch 2.12.1,
+# transformers 4.53.2, zuko 1.6.0. Floors below are deliberately loose — this
+# is a research prototype, not a library — with hard constraints called out.
+#
+# NOT listed here, because pip does not provide them:
+#   yt-dlp             vendored as a git checkout in yt-dlp/ and imported from
+#                      there, so the downloader cannot drift from the version
+#                      you tested. Clone it, don't pip install it.
+#   ffmpeg, ffprobe    external binaries on PATH. Used for every window decode
+#                      (src/data/windows.py) and duration probe
+#                      (scripts/build_manifest.py).
+#
+# GPU: install torch first from https://pytorch.org/get-started/locally/ if you
+# need a particular CUDA build — the plain wheel resolved here is CPU/MPS. On
+# AWS, the Deep Learning AMI already ships a working torch + CUDA.
+
+# --- core model stack ---
+numpy>=1.26
+torch>=2.1                # needs scaled_dot_product_attention and bf16 autocast
+transformers>=4.40,<5     # MERT's remote code imports private HuBERT internals
+                          # (HubertAttention, HubertFeedForward, ...), so a major
+                          # version bump is a real break risk. See note below.
+tensorboard>=2.16         # torch.utils.tensorboard in train.py / train_flow.py
+
+# --- cover alignment: scripts/align_covers.py ---
+librosa>=0.10.2           # beat tracking + chroma_cqt
+numba>=0.67               # see note below
+
+# --- detection flows: src/models/flow.py ---
+zuko>=1.6                 # neural spline flows
+
+# ---------------------------------------------------------------------------
+# The one dependency conflict that actually bites
+#
+# numba pins an exact NumPy *ceiling*, and it moves every release:
+#
+#     numba 0.60  ->  numpy <2.1        numba 0.66  ->  numpy <2.5
+#     numba 0.63  ->  numpy <2.4        numba 0.67  ->  numpy <2.6
+#
+# An older numba against a newer numpy fails at import, not at call time:
+#
+#     ImportError: Numba needs NumPy 2.0 or less. Got NumPy 2.4.
+#
+# which takes librosa down with it, so the chroma stage dies before doing any
+# work. Hence the >=0.67 floor. If you ever pin numpy, check numba's ceiling
+# for that numpy version first.
+#
+# Note that numba is not truly optional despite align_covers.py degrading
+# gracefully ("numba not installed; Smith-Waterman will be slow") — librosa
+# 1.0 requires numba>=0.61 outright, so installing librosa installs it.
+#
+# nnAudio is deliberately absent: MERT's remote code imports it inside a
+# try/except and only uses it when feature_extractor_cqt is true, which is
+# false in the MERT-v1-330M config.
+#
+# Two more things about MERT specifically:
+#
+# 1. Its remote code does
+#        from transformers.models.hubert.modeling_hubert import (
+#            HubertFeatureEncoder, HubertModel, HubertEncoderStableLayerNorm,
+#            HubertEncoder, HubertEncoderLayer, HubertPositionalConvEmbedding,
+#            HubertAttention, HubertFeedForward,
+#        )
+#    which are private, unstable names. Hence the <5 cap: transformers 5.x is
+#    released and this has not been tested against it. Lift the cap only after
+#    confirming MERT-v1-330M still loads.
+#
+# 2. Checkpoints must be safetensors. transformers >=4.52 refuses to torch.load
+#    a .bin checkpoint (CVE-2025-32434), so if the HF cache holds
+#    pytorch_model.bin, convert it and delete the .bin rather than downgrading.
+# ---------------------------------------------------------------------------
