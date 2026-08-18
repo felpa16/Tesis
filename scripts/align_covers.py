@@ -8,10 +8,11 @@ Two resumable stages:
           median-aggregated between beats, L2-normalized) and cache it to
           data/chroma/{split}/{key}.npz  (chroma (12,T), times (T,)).
 
-  align   For every pair of covers within a song (clique): pick the best of
-          the 12 chroma transpositions (OTI), run Smith-Waterman local
-          alignment on the binarized similarity matrix, and store the warping
-          path as aligned time arrays plus a normalized confidence score in
+  align   For every pair of covers within a song (clique, capped by
+          --max-pairs-per-song): pick the best of the 12 chroma transpositions
+          (OTI), run Smith-Waterman local alignment on the binarized similarity
+          matrix, and store the warping path as aligned time arrays plus a
+          normalized confidence score in
           data/alignments/{split}/{song_id}_{verA}_{verB}.npz
           (t_a (L,), t_b (L,), score (scalar), oti (scalar)).
 
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -266,8 +268,36 @@ def align_worker(
         return out_path.stem, f"{type(exc).__name__}: {exc}"
 
 
+def clique_pairs(keys: list[str], max_pairs: int) -> list[tuple[str, str]]:
+    """Cover pairs within one clique, capped at max_pairs (0 = every pair).
+
+    Cliques in the 2025 dataset reach 1,991 versions, so taking every
+    combination would ask for ~9M alignments on the train split alone. When the
+    cap bites, pairs are sampled with an RNG seeded by the song id, so a re-run
+    selects the same subset and the stage stays resumable.
+    """
+    keys = sorted(keys)
+    total = len(keys) * (len(keys) - 1) // 2
+    if max_pairs <= 0 or total <= max_pairs:
+        return list(itertools.combinations(keys, 2))
+
+    song_id = int(keys[0].split("_")[0])
+    rng = random.Random(song_id)
+    chosen: set[tuple[int, int]] = set()
+    while len(chosen) < max_pairs:  # max_pairs << total here, so this converges
+        i, j = rng.randrange(len(keys)), rng.randrange(len(keys))
+        if i != j:
+            chosen.add((i, j) if i < j else (j, i))
+    return [(keys[i], keys[j]) for i, j in sorted(chosen)]
+
+
 def run_align_stage(
-    data_root: Path, split: str, workers: int, match_quantile: float, gap: float
+    data_root: Path,
+    split: str,
+    workers: int,
+    match_quantile: float,
+    gap: float,
+    max_pairs_per_song: int,
 ) -> None:
     in_dir = chroma_dir(data_root, split)
     out_dir = alignment_dir(data_root, split)
@@ -281,14 +311,16 @@ def run_align_stage(
         by_song[song_id].append(path.stem)
 
     jobs: list[tuple[Path, Path, Path]] = []
+    n_pairs = 0
     for song_id, keys in by_song.items():
-        for key_a, key_b in itertools.combinations(sorted(keys), 2):
+        pairs = clique_pairs(keys, max_pairs_per_song)
+        n_pairs += len(pairs)
+        for key_a, key_b in pairs:
             out_path = out_dir / f"{song_id}_{key_a.split('_')[1]}_{key_b.split('_')[1]}.npz"
             if not out_path.exists():
                 jobs.append((in_dir / f"{key_a}.npz", in_dir / f"{key_b}.npz", out_path))
 
-    n_pairs = sum(len(k) * (len(k) - 1) // 2 for k in by_song.values())
-    print(f"[align/{split}] {n_pairs} cover pairs total, {len(jobs)} to align")
+    print(f"[align/{split}] {n_pairs} cover pairs selected, {len(jobs)} to align")
     if not jobs:
         return
 
@@ -325,6 +357,14 @@ def main() -> None:
         "--gap", type=float, default=0.5, help="Smith-Waterman gap penalty"
     )
     parser.add_argument(
+        "--max-pairs-per-song",
+        type=int,
+        default=200,
+        help="cap on aligned pairs per clique (0 = every pair). Cliques reach "
+        "1991 versions in the 2025 dataset, so the uncapped train split is ~9M "
+        "alignments; 200 keeps it near 340k",
+    )
+    parser.add_argument(
         "--max-seconds",
         type=float,
         default=600.0,
@@ -339,7 +379,12 @@ def main() -> None:
             run_chroma_stage(args.data_root, split, args.workers, args.max_seconds)
         if args.stage in ("align", "all"):
             run_align_stage(
-                args.data_root, split, args.workers, args.match_quantile, args.gap
+                args.data_root,
+                split,
+                args.workers,
+                args.match_quantile,
+                args.gap,
+                args.max_pairs_per_song,
             )
 
 

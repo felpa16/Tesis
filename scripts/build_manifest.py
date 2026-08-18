@@ -33,6 +33,7 @@ from shs100k_meta import (  # noqa: E402
     alignment_dir,
     chroma_dir,
     existing_audio,
+    split_tracks,
 )
 from src.data.manifest import (  # noqa: E402
     PairEntry,
@@ -60,6 +61,22 @@ def build_split(
 ) -> None:
     audio = existing_audio(data_root, split)
     print(f"[{split}] {len(audio)} downloaded tracks")
+
+    # The manifest, not the download, is what defines the training set, so the
+    # de-contamination in shs100k_meta has to be re-applied to whatever is
+    # actually on disk: audio fetched before the filter existed, or copied in
+    # from elsewhere, would otherwise reach training.
+    in_dataset = {t.key for t in split_tracks(split, drop_leaked=False)}
+    allowed = {t.key for t in split_tracks(split)}
+    leaked = {key for key in audio if key in in_dataset and key not in allowed}
+    stale = {key for key in audio if key not in in_dataset}
+    for key in leaked | stale:
+        del audio[key]
+    if leaked or stale:
+        print(
+            f"[{split}] excluded {len(leaked)} leaked and {len(stale)} stale "
+            f"files on disk; {len(audio)} tracks usable"
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         durations = dict(

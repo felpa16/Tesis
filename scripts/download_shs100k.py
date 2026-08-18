@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Download SHS100K audio from YouTube using the vendored yt-dlp.
 
-Audio-only streams are saved as data/audio/{split}/{song_id}_{version_id}.<ext>
+Reads the SHS-100K-official-2025 split CSVs via shs100k_meta, which rebuilds
+each watch URL from the dataset's 11-character YouTube video id.
+
+Audio-only streams are saved as data/audio/{split}/{work_id}_{performance_id}.<ext>
 (native codec, no re-encoding). Already-downloaded tracks are skipped, so the
 script is safe to interrupt and re-run. Failures are appended to a CSV log so
 the real dataset yield (link rot is expected) can be measured afterwards.

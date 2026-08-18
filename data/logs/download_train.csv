@@ -1,0 +1,9 @@
+key,url,status,detail
+35581_1232168,https://youtube.com/watch?v=FxXehNq26cE,failed,ERROR: [youtube] FxXehNq26cE: Video unavailable. This video is no longer available because the YouTube account associated with this video has been terminated.
+128361_282219,https://youtube.com/watch?v=1J49XshyrLA,failed,ERROR: [youtube] 1J49XshyrLA: This video is not available
+128361_579749,https://youtube.com/watch?v=qBw5AP8068I,failed,ERROR: [youtube] qBw5AP8068I: This video is not available
+128361_1073264,https://youtube.com/watch?v=obhFhwa8cXU,failed,ERROR: [youtube] obhFhwa8cXU: This video is not available
+128361_1739336,https://youtube.com/watch?v=1FjSIui39ls,failed,BrokenPipeError: [Errno 32] Broken pipe
+128361_304528,https://youtube.com/watch?v=Lm4_luIKvdo,failed,BrokenPipeError: [Errno 32] Broken pipe
+128361_1405351,https://youtube.com/watch?v=TrBkLSMyBWg,failed,BrokenPipeError: [Errno 32] Broken pipe
+128361_1158881,https://youtube.com/watch?v=PKUpMooPTok,failed,BrokenPipeError: [Errno 32] Broken pipe
