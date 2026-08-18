@@ -1,0 +1,4 @@
+1. definir cuantas muestras necesitamos para el primer entrenamiento online (aproximadamente)
+2. descargar esa cantidad de muestras en la compu del labo y subirlas a S3
+3. correr el entrenamiento online hasta que los pesos de atencion converjan
+4. bajar todo el dataset, pasarlo por MERT 

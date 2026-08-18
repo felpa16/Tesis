@@ -1,0 +1,14 @@
+key,url,status,detail
+5982_3,https://www.youtube.com/watch?v=Mhp9to0hMNM,failed,ERROR: [youtube] Mhp9to0hMNM: This video is no longer available because the YouTube account associated with this video has been terminated.
+5982_1,https://www.youtube.com/watch?v=lPXW_8n5bbQ,failed,ERROR: [youtube] lPXW_8n5bbQ: This video is no longer available because the YouTube account associated with this video has been terminated.
+5982_2,https://www.youtube.com/watch?v=0JP_ZipG5Z0,failed,ERROR: [youtube] 0JP_ZipG5Z0: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+5982_0,https://www.youtube.com/watch?v=Q6ix7lWPDAQ,failed,ERROR: [youtube] Q6ix7lWPDAQ: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+5982_1,https://www.youtube.com/watch?v=lPXW_8n5bbQ,failed,ERROR: [youtube] lPXW_8n5bbQ: Video unavailable
+5982_3,https://www.youtube.com/watch?v=Mhp9to0hMNM,failed,ERROR: [youtube] Mhp9to0hMNM: Video unavailable
+5984_2,https://www.youtube.com/watch?v=MiZKVA9DKqw,failed,ERROR: [youtube] MiZKVA9DKqw: This video is unavailable
+5985_0,https://www.youtube.com/watch?v=2hqm1mPrrh8,failed,ERROR: [youtube] 2hqm1mPrrh8: Video unavailable
+5985_3,https://www.youtube.com/watch?v=ODLWHx_EAs8,failed,ERROR: [youtube] ODLWHx_EAs8: Please sign in. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+5986_0,https://www.youtube.com/watch?v=CtqlYK-QB1Q,failed,ERROR: [youtube] CtqlYK-QB1Q: This video is unavailable
+5986_5,https://www.youtube.com/watch?v=riZAX1Cl38g,failed,ERROR: [youtube] riZAX1Cl38g: Video unavailable
+5987_3,https://www.youtube.com/watch?v=uNSK7D7VOvg,failed,ERROR: [youtube] uNSK7D7VOvg: This video is unavailable
+5988_1,https://www.youtube.com/watch?v=5BBsp7ozR8U,failed,ERROR: [youtube] 5BBsp7ozR8U: Video unavailable
