@@ -74,11 +74,14 @@ THROTTLE_MARKERS = (
 class DownloadOptions:
     """yt-dlp knobs shared by every worker.
 
-    Only one quantity actually controls both throughput and bot-check exposure:
-    the aggregate request rate, workers / (seconds per track + sleep). Sleeping
-    before each download and raising --workers cancel out, so pacing is left to
-    --workers, and sleep_requests -- which spaces the extraction API calls where
-    the bot check actually lives -- carries a small default instead.
+    Average request rate is not the whole story: YouTube blocks on burstiness
+    too. With no pre-download sleep a worker hits the player API the instant its
+    previous download finishes, and independent workers drift into sync, so the
+    *peak* rate spikes even when the average looks safe. The randomized
+    sleep_interval de-synchronizes them, which is why 4 workers with no sleep
+    gets blocked while more workers with sleep do not. Defaults match yt-dlp's
+    own `-t sleep` preset, which is what YouTube's rate-limit message
+    recommends. Raise --workers to buy throughput back; do not remove the sleep.
     """
 
     max_duration: int = 900
@@ -86,8 +89,8 @@ class DownloadOptions:
     cookies_from_browser: str | None = None
     player_client: str | None = None
     sleep_requests: float = 1.0
-    sleep_interval: float = 0.0
-    max_sleep_interval: float = 0.0
+    sleep_interval: float = 10.0
+    max_sleep_interval: float = 20.0
     retries: int = 3
 
 
@@ -220,10 +223,10 @@ def run_split(
     remaining = len(tracks) - len(done) - counts["ok"]
     print(f"[{split}] done: {counts}  (logged to {log_path})")
     print(
-        f"[{split}] {rate:.0f} tracks/hr sustained; at this rate the remaining "
-        f"{remaining} would take {remaining / max(rate, 1e-9) / 24:.1f} days. "
-        f"Throughput and bot-check exposure are the same number "
-        f"({rate / 3600:.2f} req/s) -- tune --workers, and watch 'throttled'."
+        f"[{split}] {rate:.0f} tracks/hr sustained ({rate / 3600:.2f} req/s); "
+        f"at this rate the remaining {remaining} would take "
+        f"{remaining / max(rate, 1e-9) / 24:.1f} days. To go faster raise "
+        f"--workers and keep the sleep on; watch 'throttled'."
     )
     if counts["throttled"]:
         print(
@@ -261,15 +264,16 @@ def main() -> None:
     parser.add_argument(
         "--sleep-interval",
         type=float,
-        default=0.0,
-        help="minimum seconds before each media download. Off by default: it "
-        "delays the media fetch rather than the API calls being rate-limited, "
-        "so --workers is the better rate knob",
+        default=10.0,
+        help="minimum seconds before each download. Randomized up to "
+        "--max-sleep-interval, which de-synchronizes workers and smooths the "
+        "request bursts YouTube blocks on. Setting this to 0 gets you "
+        "bot-checked even at low worker counts",
     )
     parser.add_argument(
         "--max-sleep-interval",
         type=float,
-        default=0.0,
+        default=20.0,
         help="upper bound of the randomized pre-download sleep",
     )
     parser.add_argument(

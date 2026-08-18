@@ -8,4 +8,5 @@ __pycache__/
 *.pyc
 .DS_Store
 shs-100k/
+yt-dlp/
 IGNORE

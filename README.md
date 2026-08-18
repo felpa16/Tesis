@@ -197,31 +197,33 @@ wrong fix — they make it worse in three separate ways:
 * A running browser rotates the session cookies out from under the download;
   yt-dlp detects this and warns about it (`_base.py:820`).
 
-The real fix is slowing down — but there is only **one** dial, and it is
-`--workers`.
+The real fix is pacing, and **randomized sleep is not interchangeable with a
+lower worker count**. Average request rate is only part of what YouTube reacts
+to; burstiness is the rest. With no pre-download sleep, a worker hits the player
+API the instant its previous download finishes, and independent workers drift
+into sync — so the *peak* rate spikes even when the average looks safe. This is
+why 4 workers with no sleep gets bot-checked while more workers with sleep run
+clean.
 
-Throughput and bot-check exposure are the same quantity: the aggregate request
-rate, `workers / (seconds per track + sleep)`. Sleeping before each download and
-adding workers cancel out, so you cannot buy safety with sleep and buy the speed
-back with concurrency. At a measured ~19 s per track per worker:
+So `--sleep-interval` / `--max-sleep-interval` default to **10–20 s**, matching
+yt-dlp's own `-t sleep` preset, which is what YouTube's rate-limit message
+recommends. The randomization is the point: it de-synchronizes workers.
+`--sleep-requests` (default 1 s) additionally spaces the extraction API calls,
+where the bot check lives.
 
-| workers | pre-download sleep | tracks/hr | req/s | days for 109,366 |
-|---|---|---|---|---|
-| 4 | none | 766 | 0.21 | 5.9 |
-| 4 | 10–20 s | 426 | 0.12 | 10.7 |
-| 8 | none | 1,532 | 0.43 | 3.0 |
-| 16 | none | 3,064 | 0.85 | 1.5 |
-| 16 | 10–20 s | 1,704 | 0.47 | 2.7 |
+Since the sleep is per worker, throughput is bought back with `--workers`:
 
-Note that "16 workers + 10–20 s" and "8 workers + none" are the same request
-rate and therefore the same risk — the sleep bought nothing that dropping to 8
-workers would not have bought more simply.
+| workers | tracks/hr | days for 109,366 |
+|---|---|---|
+| 4 | 391 | 11.6 |
+| 8 | 783 | 5.8 |
+| 16 | 1,565 | 2.9 |
+| 24 | 2,348 | 1.9 |
+| 32 | 3,130 | 1.5 |
 
-So `--sleep-interval` defaults to **0**. What stays on is `--sleep-requests`
-(default 1 s), which spaces the *extraction API* calls — where the bot check
-actually lives, as opposed to the media fetch — and costs only a few seconds per
-track. Tune `--workers` against the `throttled` count and the `tracks/hr`
-readout the script prints; those are the empirical version of this table.
+Tune `--workers` upward against the `throttled` count and the `tracks/hr`
+readout the script prints, keeping the sleep on throughout. Do not trade the
+sleep away for fewer workers — that is the combination that gets blocked.
 `--player-client` is an escape hatch for forcing specific clients.
 
 ### 2. Chroma and cover alignment
