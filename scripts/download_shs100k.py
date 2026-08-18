@@ -25,6 +25,7 @@ import argparse
 import csv
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,18 +74,20 @@ THROTTLE_MARKERS = (
 class DownloadOptions:
     """yt-dlp knobs shared by every worker.
 
-    Sleep defaults match yt-dlp's own `-t sleep` preset, which is what YouTube's
-    rate-limit message recommends. They cost throughput but a bot-check lockout
-    costs an hour, so leaving them on is the cheaper trade for a multi-day run.
+    Only one quantity actually controls both throughput and bot-check exposure:
+    the aggregate request rate, workers / (seconds per track + sleep). Sleeping
+    before each download and raising --workers cancel out, so pacing is left to
+    --workers, and sleep_requests -- which spaces the extraction API calls where
+    the bot check actually lives -- carries a small default instead.
     """
 
     max_duration: int = 900
     cookies: str | None = None
     cookies_from_browser: str | None = None
     player_client: str | None = None
-    sleep_requests: float = 0.75
-    sleep_interval: float = 10.0
-    max_sleep_interval: float = 20.0
+    sleep_requests: float = 1.0
+    sleep_interval: float = 0.0
+    max_sleep_interval: float = 0.0
     retries: int = 3
 
 
@@ -176,11 +179,14 @@ def run_split(
     )
     if not todo:
         return
-    print(
-        f"[{split}] {workers} workers, sleeping "
-        f"{options.sleep_interval:g}-{options.max_sleep_interval:g}s between "
-        f"downloads and {options.sleep_requests:g}s between requests"
-    )
+    pacing = f"{options.sleep_requests:g}s between requests"
+    if options.sleep_interval > 0:
+        pacing += (
+            f", {options.sleep_interval:g}-{options.max_sleep_interval:g}s "
+            f"before each download"
+        )
+    print(f"[{split}] {workers} workers, {pacing}")
+    started = time.monotonic()
 
     counts = {"ok": 0, "gone": 0, "throttled": 0, "failed": 0, "filtered": 0}
     write_header = not log_path.exists()
@@ -202,13 +208,23 @@ def run_split(
                     log.writerow([track.key, track.url, status, retryable, detail])
                     log_file.flush()
                 if i % 50 == 0 or i == len(todo):
+                    rate = i / max(time.monotonic() - started, 1e-9) * 3600
                     with _print_lock:
                         print(
                             f"[{split}] {i}/{len(todo)}  "
                             + "  ".join(f"{k}={v}" for k, v in counts.items() if v)
+                            + f"  {rate:.0f}/hr"
                         )
 
+    rate = len(todo) / max(time.monotonic() - started, 1e-9) * 3600
+    remaining = len(tracks) - len(done) - counts["ok"]
     print(f"[{split}] done: {counts}  (logged to {log_path})")
+    print(
+        f"[{split}] {rate:.0f} tracks/hr sustained; at this rate the remaining "
+        f"{remaining} would take {remaining / max(rate, 1e-9) / 24:.1f} days. "
+        f"Throughput and bot-check exposure are the same number "
+        f"({rate / 3600:.2f} req/s) -- tune --workers, and watch 'throttled'."
+    )
     if counts["throttled"]:
         print(
             f"[{split}] {counts['throttled']} downloads were rate-limited by "
@@ -238,20 +254,22 @@ def main() -> None:
     parser.add_argument(
         "--sleep-requests",
         type=float,
-        default=0.75,
-        help="seconds between API requests (default matches yt-dlp's -t sleep)",
+        default=1.0,
+        help="seconds between extraction API requests, where the bot check "
+        "lives. Cheap: a few seconds per track, per worker",
     )
     parser.add_argument(
         "--sleep-interval",
         type=float,
-        default=10.0,
-        help="minimum seconds before each download; 0 disables pacing and "
-        "invites the bot check",
+        default=0.0,
+        help="minimum seconds before each media download. Off by default: it "
+        "delays the media fetch rather than the API calls being rate-limited, "
+        "so --workers is the better rate knob",
     )
     parser.add_argument(
         "--max-sleep-interval",
         type=float,
-        default=20.0,
+        default=0.0,
         help="upper bound of the randomized pre-download sleep",
     )
     parser.add_argument(

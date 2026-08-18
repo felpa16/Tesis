@@ -197,10 +197,31 @@ wrong fix — they make it worse in three separate ways:
 * A running browser rotates the session cookies out from under the download;
   yt-dlp detects this and warns about it (`_base.py:820`).
 
-The real fix is pacing. `--sleep-interval` / `--max-sleep-interval` (default
-10–20 s, matching yt-dlp's own `-t sleep` preset, which is what YouTube's
-rate-limit message recommends) and `--sleep-requests` (default 0.75 s) are
-already on. If blocks persist, lower `--workers` before raising the sleeps.
+The real fix is slowing down — but there is only **one** dial, and it is
+`--workers`.
+
+Throughput and bot-check exposure are the same quantity: the aggregate request
+rate, `workers / (seconds per track + sleep)`. Sleeping before each download and
+adding workers cancel out, so you cannot buy safety with sleep and buy the speed
+back with concurrency. At a measured ~19 s per track per worker:
+
+| workers | pre-download sleep | tracks/hr | req/s | days for 109,366 |
+|---|---|---|---|---|
+| 4 | none | 766 | 0.21 | 5.9 |
+| 4 | 10–20 s | 426 | 0.12 | 10.7 |
+| 8 | none | 1,532 | 0.43 | 3.0 |
+| 16 | none | 3,064 | 0.85 | 1.5 |
+| 16 | 10–20 s | 1,704 | 0.47 | 2.7 |
+
+Note that "16 workers + 10–20 s" and "8 workers + none" are the same request
+rate and therefore the same risk — the sleep bought nothing that dropping to 8
+workers would not have bought more simply.
+
+So `--sleep-interval` defaults to **0**. What stays on is `--sleep-requests`
+(default 1 s), which spaces the *extraction API* calls — where the bot check
+actually lives, as opposed to the media fetch — and costs only a few seconds per
+track. Tune `--workers` against the `throttled` count and the `tracks/hr`
+readout the script prints; those are the empirical version of this table.
 `--player-client` is an escape hatch for forcing specific clients.
 
 ### 2. Chroma and cover alignment
