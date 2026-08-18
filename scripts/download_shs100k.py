@@ -6,8 +6,12 @@ each watch URL from the dataset's 11-character YouTube video id.
 
 Audio-only streams are saved as data/audio/{split}/{work_id}_{performance_id}.<ext>
 (native codec, no re-encoding). Already-downloaded tracks are skipped, so the
-script is safe to interrupt and re-run. Failures are appended to a CSV log so
-the real dataset yield (link rot is expected) can be measured afterwards.
+script is safe to interrupt and re-run. Outcomes are appended to a CSV log,
+classified so a re-run can target the retryable failures and ignore link rot.
+
+Run anonymously. Passing cookies switches yt-dlp to a different, more heavily
+policed set of player clients and usually makes yield *worse* -- see the
+--cookies-from-browser help text.
 
 Examples:
     python scripts/download_shs100k.py --split val --limit 20      # smoke test
@@ -22,6 +26,7 @@ import csv
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -41,14 +46,59 @@ from shs100k_meta import (  # noqa: E402
 
 _print_lock = threading.Lock()
 
+# Errors that mean the video is gone for good: retrying wastes time, and these
+# are the expected ~24% link rot, not a problem with the downloader.
+GONE_MARKERS = (
+    "video unavailable",
+    "private video",
+    "has been removed",
+    "has been terminated",
+    "no longer available",
+    "removed for violating",
+    "does not exist",
+)
 
-def build_ydl_opts(
-    out_dir: Path,
-    key: str,
-    max_duration: int,
-    cookies: str | None,
-    cookies_from_browser: str | None,
-) -> dict:
+# Errors that mean YouTube is throttling this session. Not permanent: they are
+# fixed by slowing down, never by authenticating.
+THROTTLE_MARKERS = (
+    "not a bot",
+    "needs to be reloaded",
+    "too many requests",
+    "http error 429",
+    "rate-limited",
+)
+
+
+@dataclass(frozen=True)
+class DownloadOptions:
+    """yt-dlp knobs shared by every worker.
+
+    Sleep defaults match yt-dlp's own `-t sleep` preset, which is what YouTube's
+    rate-limit message recommends. They cost throughput but a bot-check lockout
+    costs an hour, so leaving them on is the cheaper trade for a multi-day run.
+    """
+
+    max_duration: int = 900
+    cookies: str | None = None
+    cookies_from_browser: str | None = None
+    player_client: str | None = None
+    sleep_requests: float = 0.75
+    sleep_interval: float = 10.0
+    max_sleep_interval: float = 20.0
+    retries: int = 3
+
+
+def classify(error: str) -> str:
+    """'gone' (permanent), 'throttled', or 'failed' (retryable) for an error."""
+    lowered = error.lower()
+    if any(marker in lowered for marker in GONE_MARKERS):
+        return "gone"
+    if any(marker in lowered for marker in THROTTLE_MARKERS):
+        return "throttled"
+    return "failed"
+
+
+def build_ydl_opts(out_dir: Path, key: str, options: DownloadOptions) -> dict:
     opts: dict = {
         "format": "bestaudio/best",
         "outtmpl": str(out_dir / f"{key}.%(ext)s"),
@@ -56,56 +106,58 @@ def build_ydl_opts(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": options.retries,
+        "fragment_retries": options.retries,
         "socket_timeout": 30,
+        "sleep_interval_requests": options.sleep_requests,
+        "sleep_interval": options.sleep_interval,
+        "max_sleep_interval": max(options.max_sleep_interval, options.sleep_interval),
     }
-    if max_duration > 0:
+    if options.max_duration > 0:
         opts["match_filter"] = yt_dlp.utils.match_filter_func(
-            f"duration <= {max_duration}"
+            f"duration <= {options.max_duration}"
         )
-    if cookies:
-        opts["cookiefile"] = cookies
-    if cookies_from_browser:
-        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    if options.cookies:
+        opts["cookiefile"] = options.cookies
+    if options.cookies_from_browser:
+        opts["cookiesfrombrowser"] = (options.cookies_from_browser,)
+    if options.player_client:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": options.player_client.split(",")}
+        }
     return opts
 
 
+def downloaded_file(out_dir: Path, key: str) -> Path | None:
+    """The finished audio file for a key, ignoring in-progress .part files."""
+    for path in out_dir.glob(f"{key}.*"):
+        if path.is_file() and ".part" not in path.name:
+            return path
+    return None
+
+
 def download_one(
-    track: Track,
-    out_dir: Path,
-    max_duration: int,
-    cookies: str | None,
-    cookies_from_browser: str | None,
+    track: Track, out_dir: Path, options: DownloadOptions
 ) -> tuple[str, str]:
     """Download a single track. Returns (status, detail)."""
     error = ""
     try:
-        opts = build_ydl_opts(
-            out_dir, track.key, max_duration, cookies, cookies_from_browser
-        )
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(build_ydl_opts(out_dir, track.key, options)) as ydl:
             ydl.download([track.url])
     except yt_dlp.utils.DownloadError as exc:
         error = str(exc).replace("\n", " ")
     except Exception as exc:  # network hiccups, extractor bugs, ...
         error = f"{type(exc).__name__}: {exc}"
 
-    if any(out_dir.glob(f"{track.key}.*")):
+    if downloaded_file(out_dir, track.key) is not None:
         return "ok", ""
     if error:
-        return "failed", error
-    return "filtered", f"skipped (duration > {max_duration}s or no media)"
+        return classify(error), error
+    return "filtered", f"skipped (duration > {options.max_duration}s or no media)"
 
 
 def run_split(
-    split: str,
-    data_root: Path,
-    workers: int,
-    limit: int,
-    max_duration: int,
-    cookies: str | None,
-    cookies_from_browser: str | None,
+    split: str, data_root: Path, workers: int, limit: int, options: DownloadOptions
 ) -> None:
     out_dir = audio_dir(data_root, split)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -124,38 +176,46 @@ def run_split(
     )
     if not todo:
         return
+    print(
+        f"[{split}] {workers} workers, sleeping "
+        f"{options.sleep_interval:g}-{options.max_sleep_interval:g}s between "
+        f"downloads and {options.sleep_requests:g}s between requests"
+    )
 
-    counts = {"ok": 0, "failed": 0, "filtered": 0}
+    counts = {"ok": 0, "gone": 0, "throttled": 0, "failed": 0, "filtered": 0}
     write_header = not log_path.exists()
     with open(log_path, "a", newline="", encoding="utf-8") as log_file:
         log = csv.writer(log_file)
         if write_header:
-            log.writerow(["key", "url", "status", "detail"])
+            log.writerow(["key", "url", "status", "retryable", "detail"])
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(
-                    download_one, t, out_dir, max_duration, cookies,
-                    cookies_from_browser,
-                ): t
-                for t in todo
+                pool.submit(download_one, t, out_dir, options): t for t in todo
             }
             for i, future in enumerate(as_completed(futures), 1):
                 track = futures[future]
                 status, detail = future.result()
                 counts[status] += 1
                 if status != "ok":
-                    log.writerow([track.key, track.url, status, detail])
+                    retryable = "no" if status in ("gone", "filtered") else "yes"
+                    log.writerow([track.key, track.url, status, retryable, detail])
                     log_file.flush()
                 if i % 50 == 0 or i == len(todo):
                     with _print_lock:
                         print(
                             f"[{split}] {i}/{len(todo)}  "
-                            f"ok={counts['ok']} failed={counts['failed']} "
-                            f"filtered={counts['filtered']}"
+                            + "  ".join(f"{k}={v}" for k, v in counts.items() if v)
                         )
 
-    print(f"[{split}] done: {counts}  (failures logged to {log_path})")
+    print(f"[{split}] done: {counts}  (logged to {log_path})")
+    if counts["throttled"]:
+        print(
+            f"[{split}] {counts['throttled']} downloads were rate-limited by "
+            f"YouTube. Re-run to retry them, and if it persists lower --workers "
+            f"or raise --sleep-interval. Do NOT reach for cookies: they switch "
+            f"yt-dlp to more heavily policed player clients and make this worse."
+        )
 
 
 def main() -> None:
@@ -173,27 +233,71 @@ def main() -> None:
         help="skip videos longer than this many seconds (0 = no filter)",
     )
     parser.add_argument(
+        "--retries", type=int, default=3, help="yt-dlp retries per download"
+    )
+    parser.add_argument(
+        "--sleep-requests",
+        type=float,
+        default=0.75,
+        help="seconds between API requests (default matches yt-dlp's -t sleep)",
+    )
+    parser.add_argument(
+        "--sleep-interval",
+        type=float,
+        default=10.0,
+        help="minimum seconds before each download; 0 disables pacing and "
+        "invites the bot check",
+    )
+    parser.add_argument(
+        "--max-sleep-interval",
+        type=float,
+        default=20.0,
+        help="upper bound of the randomized pre-download sleep",
+    )
+    parser.add_argument(
+        "--player-client",
+        type=str,
+        default=None,
+        help="override yt-dlp's YouTube player clients, comma-separated "
+        "(e.g. 'visionos,android_vr'). Escape hatch only; the defaults are "
+        "already chosen to avoid PO-token and bot-check paths",
+    )
+    parser.add_argument(
         "--cookies", type=str, default=None, help="cookies.txt for restricted videos"
     )
     parser.add_argument(
         "--cookies-from-browser",
         type=str,
         default=None,
-        help="browser to read YouTube cookies from (e.g. chrome, firefox, safari)",
+        help="browser to read YouTube cookies from. NOT RECOMMENDED: cookies "
+        "make yt-dlp use _DEFAULT_AUTHED_CLIENTS (tv_downgraded, web) instead "
+        "of the safer anonymous set, the rate limit becomes account-global "
+        "instead of per-session, and a running browser rotates the cookies out "
+        "from under the download",
     )
     args = parser.parse_args()
 
+    options = DownloadOptions(
+        max_duration=args.max_duration,
+        cookies=args.cookies,
+        cookies_from_browser=args.cookies_from_browser,
+        player_client=args.player_client,
+        sleep_requests=args.sleep_requests,
+        sleep_interval=args.sleep_interval,
+        max_sleep_interval=args.max_sleep_interval,
+        retries=args.retries,
+    )
+    if options.cookies or options.cookies_from_browser:
+        print(
+            "[warning] downloading with cookies. This switches yt-dlp to the "
+            "authenticated player clients, scopes YouTube's rate limit to the "
+            "account rather than the session, and breaks when the browser "
+            "rotates the cookies. Anonymous downloading is the supported path."
+        )
+
     splits = list(SPLITS) if args.split == "all" else [args.split]
     for split in splits:
-        run_split(
-            split,
-            args.data_root,
-            args.workers,
-            args.limit,
-            args.max_duration,
-            args.cookies,
-            args.cookies_from_browser,
-        )
+        run_split(split, args.data_root, args.workers, args.limit, options)
 
 
 if __name__ == "__main__":

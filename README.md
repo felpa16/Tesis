@@ -69,8 +69,12 @@ Stage 5 turns the latents into an anomaly score.
 | `tensorboard` | `train.py`, `train_flow.py` | imported via `torch.utils.tensorboard` |
 
 ```bash
-pip install torch numpy transformers librosa numba zuko tensorboard
+pip install -r requirements.txt
 ```
+
+`requirements.txt` carries the version floors and documents the one dependency
+conflict that actually bites (numba pins a moving NumPy *ceiling*) plus the two
+MERT-specific constraints.
 
 **External binaries**: `ffmpeg` (window decoding, chroma) and `ffprobe`
 (duration probing) must be on `PATH`.
@@ -85,10 +89,13 @@ git clone https://github.com/yt-dlp/yt-dlp               yt-dlp
 `scripts/download_shs100k.py` imports the vendored `yt-dlp` directly, so it is
 never out of sync with what you tested.
 
-> **Current environment note.** As of the last check, the active interpreter
-> (`/opt/anaconda3`) has `torch`, `numpy`, `transformers` and `scipy` but is
-> **missing `librosa`, `zuko` and `tensorboard`**, and its `numba` fails to
-> import. Stages 2, 4 and 5 will not run until those are installed.
+> **Current environment note.** As of 2026-08-18 the active interpreter
+> (`/opt/anaconda3`, Python 3.12.2) has `torch` 2.12.1, `numpy` 2.4.5 and
+> `transformers` 4.53.2, but is **missing `librosa`, `zuko` and `tensorboard`**,
+> and its `numba` 0.60 raises `ImportError: Numba needs NumPy 2.0 or less. Got
+> NumPy 2.4.` at import. Stages 2, 4 and 5 will not run until this is fixed —
+> `pip install -r requirements.txt` installs what is missing and upgrades numba
+> past the NumPy ceiling.
 
 ---
 
@@ -163,8 +170,38 @@ real yield can be measured.
 
 The bottleneck is YouTube's per-stream pacing (~2.2 Mbps, roughly playback
 rate), **not** your bandwidth — raise `--workers`, don't investigate the
-connection. Expect 3–6 days of continuous uptime for the full dataset. Useful
-flags: `--max-duration` (default 900 s), `--cookies`, `--cookies-from-browser`.
+connection. Expect 3–6 days of continuous uptime for the full dataset.
+
+Outcomes are classified in the log so a re-run can target what is worth
+retrying:
+
+| status | retryable | meaning |
+|---|---|---|
+| `ok` | — | downloaded |
+| `gone` | no | link rot: unavailable, private, removed, terminated. The expected ~24% |
+| `throttled` | yes | YouTube rate-limited the session. Slow down and re-run |
+| `failed` | yes | anything else — network, extractor hiccup |
+| `filtered` | no | longer than `--max-duration` (default 900 s) |
+
+**Run anonymously.** If you hit *"Sign in to confirm you're not a bot"* or
+*"The page needs to be reloaded"*, that is rate limiting, and cookies are the
+wrong fix — they make it worse in three separate ways:
+
+* yt-dlp switches from `_DEFAULT_CLIENTS` (`visionos`, `android_vr`, `web`) to
+  `_DEFAULT_AUTHED_CLIENTS` (`tv_downgraded`, `web`); the anonymous set is
+  chosen precisely to avoid PO-token and bot-check paths
+  (`yt-dlp/yt_dlp/extractor/youtube/_video.py:143`).
+* YouTube's ~1-hour rate limit becomes scoped to *the account* rather than the
+  session, which caps scale-out no matter how many machines you run
+  (`_video.py:4068`).
+* A running browser rotates the session cookies out from under the download;
+  yt-dlp detects this and warns about it (`_base.py:820`).
+
+The real fix is pacing. `--sleep-interval` / `--max-sleep-interval` (default
+10–20 s, matching yt-dlp's own `-t sleep` preset, which is what YouTube's
+rate-limit message recommends) and `--sleep-requests` (default 0.75 s) are
+already on. If blocks persist, lower `--workers` before raising the sleeps.
+`--player-client` is an escape hatch for forcing specific clients.
 
 ### 2. Chroma and cover alignment
 
@@ -323,6 +360,7 @@ if window centers are mapped through the warping path incorrectly.
 ```
 CLAUDE.md                design rationale and research decisions
 README.md                this file
+requirements.txt         Python dependencies, with the version traps documented
 shs-100k/                dataset metadata checkout (CSVs)
 yt-dlp/                  vendored downloader
 mert.py                  scratch: standalone MERT exploration, not part of the pipeline
