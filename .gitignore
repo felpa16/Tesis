@@ -1,1 +1,11 @@
+'IGNORE'
 CLAUDE.md
+.claude
+data/
+checkpoionts/
+runs/
+__pycache__/
+*.pyc
+.DS_Store
+shs-100k/
+IGNORE
