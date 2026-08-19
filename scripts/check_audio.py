@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,28 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from shs100k_meta import DEFAULT_DATA_ROOT, SPLITS, audio_dir  # noqa: E402
+
+
+def require_ffprobe() -> None:
+    """Fail loudly and once if ffprobe is missing or broken.
+
+    Without this, a missing binary raises FileNotFoundError inside every probe
+    and the report claims every file in the dataset is corrupt -- which is how
+    this check first went wrong.
+    """
+    if shutil.which("ffprobe") is None:
+        raise SystemExit(
+            "ffprobe not found on PATH. It ships with ffmpeg, which this whole "
+            "pipeline needs (window decoding, chroma, duration probing):\n"
+            "    Debian/Ubuntu:  sudo apt install ffmpeg\n"
+            "    macOS:          brew install ffmpeg"
+        )
+    try:
+        subprocess.run(
+            ["ffprobe", "-version"], capture_output=True, check=True, timeout=30
+        )
+    except Exception as exc:
+        raise SystemExit(f"ffprobe is on PATH but will not run: {exc}") from exc
 
 
 def probe(path: Path) -> dict:
@@ -45,8 +68,13 @@ def probe(path: Path) -> dict:
     try:
         out = subprocess.run(cmd, capture_output=True, check=True, timeout=60).stdout
         data = json.loads(out)
-    except Exception as exc:
-        return {"path": path, "error": f"{type(exc).__name__}: {exc}"}
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode(errors="replace").strip().replace("\n", " ")
+        return {"path": path, "error": detail[:120] or "ffprobe rejected the file"}
+    except subprocess.TimeoutExpired:
+        return {"path": path, "error": "ffprobe timed out"}
+    except json.JSONDecodeError:
+        return {"path": path, "error": "ffprobe produced no parseable output"}
 
     streams = data.get("streams") or []
     audio = [s for s in streams if s.get("codec_type") == "audio"]
@@ -112,10 +140,17 @@ def check_split(data_root: Path, split: str, workers: int, min_duration: float) 
         problems += len(rows)
         print(f"  ! {len(rows)} {label} -- {hint}")
         for row in rows[:5]:
-            print(f"      {row['path'].name}")
+            reason = f"  ({row['error']})" if row.get("error") else ""
+            print(f"      {row['path'].name}{reason}")
         if len(rows) > 5:
             print(f"      ... and {len(rows) - 5} more")
 
+    if broken and len(broken) == len(results):
+        print(
+            f"\n  NOTE: every single file failed to probe. That is an "
+            f"environment problem, not corrupt data -- check the ffprobe error "
+            f"above and confirm you are pointing --data-root at the right disk."
+        )
     if not problems:
         print("  no problems found; ready to upload")
     return problems
@@ -133,6 +168,7 @@ def main() -> None:
         help="flag files shorter than this many seconds (= the training window)",
     )
     args = parser.parse_args()
+    require_ffprobe()
 
     splits = list(SPLITS) if args.split == "all" else [args.split]
     problems = sum(
