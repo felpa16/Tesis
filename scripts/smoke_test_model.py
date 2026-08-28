@@ -31,7 +31,11 @@ from src.config import TrainConfig  # noqa: E402
 from src.data import WindowConfig, read_pairs, read_tracks  # noqa: E402
 from src.data.windows import decode_window  # noqa: E402
 from src.models import DisentanglementModel, MertExtractor  # noqa: E402
-from src.training import compute_losses, extract_mixes  # noqa: E402
+from src.training import (  # noqa: E402
+    compute_losses,
+    extract_mixes,
+    pooled_targets,
+)
 
 
 def count_parameters(*modules: torch.nn.Module) -> int:
@@ -61,10 +65,15 @@ def check_shapes_and_losses(config: TrainConfig) -> None:
     assert short_content.shape == (batch, 60, config.mert.dim)
     print("decode ok: matched-length and cross-length reconstruction")
 
-    model.content_std.update(content_mix)
-    model.style_std.update(style_mix)
+    content_target, style_target = pooled_targets(config.loss, content_mix, style_mix)
+    expected = n_frames // max(config.loss.recon_pool, 1)
+    assert content_target.shape == (batch, expected, config.mert.dim)
+    print(f"pooled target ok: {n_frames} -> {expected} frames")
+
+    model.content_std.update(content_target)
+    model.style_std.update(style_target)
     total, losses = compute_losses(
-        model, config.loss, content, style, content_mix, style_mix, p, k
+        model, config.loss, content, style, content_target, style_target, p, k
     )
     for name, value in losses.items():
         assert torch.isfinite(value), f"{name} not finite"
@@ -113,11 +122,12 @@ def check_with_mert(config: TrainConfig, data_root: Path, split: str) -> None:
         f"{tuple(content_mix.shape)} (~{expected_frames / 5.0:.0f} frames/s)"
     )
 
-    model.content_std.update(content_mix)
-    model.style_std.update(style_mix)
+    content_target, style_target = pooled_targets(config.loss, content_mix, style_mix)
+    model.content_std.update(content_target)
+    model.style_std.update(style_target)
     content, style = model.encode_mixes(content_mix, style_mix)
     total, losses = compute_losses(
-        model, config.loss, content, style, content_mix, style_mix, 1, 1
+        model, config.loss, content, style, content_target, style_target, 1, 1
     )
     assert torch.isfinite(total)
     total.backward()

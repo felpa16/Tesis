@@ -36,7 +36,12 @@ sys.path.insert(0, str(SCRIPTS_DIR.parent))
 from src.config import config_from_dict  # noqa: E402
 from src.data import TrackWindowDataset, WindowConfig, read_tracks  # noqa: E402
 from src.models import DisentanglementModel, MertExtractor  # noqa: E402
-from src.training import extract_mixes, pick_device, worker_init  # noqa: E402
+from src.training import (  # noqa: E402
+    extract_mixes,
+    pick_device,
+    pooled_targets,
+    worker_init,
+)
 
 
 def report_layer_weights(weights: dict[str, torch.Tensor], n_states: int) -> None:
@@ -60,8 +65,14 @@ def report_layer_weights(weights: dict[str, torch.Tensor], n_states: int) -> Non
 
 
 @torch.no_grad()
-def measure_baselines(mert, model, loader, device, n_batches, micro_batch, autocast):
-    """Compare the real recon against the two trivial predictors, same batches."""
+def measure_baselines(
+    mert, model, loader, device, n_batches, mert_config, loss_config, autocast
+):
+    """Compare the real recon against the two trivial predictors, same batches.
+
+    Scored against the same pooled target the training loss uses, so the
+    baselines stay comparable to the numbers in the training log.
+    """
     totals = {k: 0.0 for k in ("recon", "global_mean", "window_mean", "pred_std")}
     seen = 0
     for i, batch in enumerate(loader):
@@ -69,12 +80,19 @@ def measure_baselines(mert, model, loader, device, n_batches, micro_batch, autoc
             break
         waves = batch["wave"].to(device)
         with autocast:
-            content_mix, style_mix = extract_mixes(mert, model, waves, micro_batch)
+            content_mix, style_mix = extract_mixes(
+                mert, model, waves, mert_config.micro_batch
+            )
+            content_target, style_target = pooled_targets(
+                loss_config, content_mix, style_mix
+            )
             content, style = model.encode_mixes(content_mix, style_mix)
-            pred_content, pred_style = model.decode(content, style, content_mix.shape[1])
+            pred_content, pred_style = model.decode(
+                content, style, content_target.shape[1]
+            )
         for pred, mix, std in (
-            (pred_content, content_mix, model.content_std),
-            (pred_style, style_mix, model.style_std),
+            (pred_content, content_target, model.content_std),
+            (pred_style, style_target, model.style_std),
         ):
             z = std.normalize(mix.float())
             totals["recon"] += F.mse_loss(pred.float(), z).item()
@@ -98,12 +116,28 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--recon-pool",
+        type=int,
+        help="override the checkpoint's pooling factor. Checkpoints written "
+        "before recon_pool existed carry no value and inherit the current "
+        "default, so pass --recon-pool 1 to audit a pre-pooling run.",
+    )
     parser.add_argument("--weights-only", action="store_true", help="skip the data pass")
     args = parser.parse_args()
 
     device = pick_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = config_from_dict(checkpoint["config"])
+    stored_pool = checkpoint["config"].get("loss", {}).get("recon_pool")
+    if args.recon_pool is not None:
+        config.loss.recon_pool = args.recon_pool
+    elif stored_pool is None:
+        print(
+            f"warning: this checkpoint predates recon_pool; assuming "
+            f"{config.loss.recon_pool}. Pass --recon-pool 1 if it was trained "
+            f"on the unpooled target."
+        )
     model = DisentanglementModel(config).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -139,9 +173,12 @@ def main() -> None:
         else torch.autocast("cpu", enabled=False)
     )
 
+    frames = int(config.data.window_seconds * 75)
+    pool = config.loss.recon_pool
     print(f"\n{'=' * 72}\nRECON vs. TRIVIAL PREDICTORS ({args.batches} batches)\n{'=' * 72}")
+    print(f"  recon_pool={pool}  ->  target is ~{frames // max(pool, 1)} frames, not {frames}")
     scores, seen = measure_baselines(
-        mert, model, loader, device, args.batches, config.mert.micro_batch, autocast
+        mert, model, loader, device, args.batches, config.mert, config.loss, autocast
     )
     ceiling, floor, actual = scores["global_mean"], scores["window_mean"], scores["recon"]
     print(f"\n  predict dataset mean      {ceiling:.4f}   <- learning nothing")

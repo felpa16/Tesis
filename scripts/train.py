@@ -55,6 +55,7 @@ from src.training import (  # noqa: E402
     make_optimizer,
     make_scheduler,
     pick_device,
+    pooled_targets,
     worker_init,
 )
 
@@ -155,9 +156,12 @@ def validate(
         content_mix, style_mix = extract_mixes(
             mert, model, waves, config.mert.micro_batch
         )
+        content_target, style_target = pooled_targets(
+            config.loss, content_mix, style_mix
+        )
         content, style = model.encode_mixes(content_mix, style_mix)
         total, losses = compute_losses(
-            model, config.loss, content, style, content_mix, style_mix, p, k
+            model, config.loss, content, style, content_target, style_target, p, k
         )
         sums["total"] += float(total)
         for name, value in losses.items():
@@ -243,6 +247,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int)
     parser.add_argument("--checkpoint-every", type=int)
     parser.add_argument("--mert-micro-batch", type=int)
+    parser.add_argument(
+        "--recon-pool",
+        type=int,
+        help="temporal pooling factor for the reconstruction target (1 = off)",
+    )
     parser.add_argument("--freeze-layer-weights", action="store_true")
     parser.add_argument("--resume", type=Path, help="checkpoint to resume from")
     return parser.parse_args()
@@ -270,6 +279,7 @@ def apply_overrides(config: TrainConfig, args: argparse.Namespace) -> None:
         (args.log_every, lambda v: setattr(direct, "log_every", v)),
         (args.checkpoint_every, lambda v: setattr(direct, "checkpoint_every", v)),
         (args.mert_micro_batch, lambda v: setattr(config.mert, "micro_batch", v)),
+        (args.recon_pool, lambda v: setattr(config.loss, "recon_pool", v)),
     ]
     for value, setter in mapping:
         if value is not None:
@@ -349,11 +359,21 @@ def main() -> None:
                 content_mix, style_mix = extract_mixes(
                     mert, model, waves, config.mert.micro_batch
                 )
-                model.content_std.update(content_mix)
-                model.style_std.update(style_mix)
+                content_target, style_target = pooled_targets(
+                    config.loss, content_mix, style_mix
+                )
+                model.content_std.update(content_target)
+                model.style_std.update(style_target)
                 content, style = model.encode_mixes(content_mix, style_mix)
                 total, losses = compute_losses(
-                    model, config.loss, content, style, content_mix, style_mix, p, k
+                    model,
+                    config.loss,
+                    content,
+                    style,
+                    content_target,
+                    style_target,
+                    p,
+                    k,
                 )
 
             optimizer.zero_grad(set_to_none=True)
