@@ -18,6 +18,7 @@ from src.losses import (
     cycle_loss,
     hsic_loss,
     mil_nce,
+    pool_frames,
     pool_tokens,
     standardized_mse,
 )
@@ -101,17 +102,34 @@ def extract_mixes(
     return torch.cat(content_chunks), torch.cat(style_chunks)
 
 
+def pooled_targets(
+    loss_config: LossConfig, content_mix: torch.Tensor, style_mix: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Branch mixes -> reconstruction targets, average-pooled over time.
+
+    The encoders still consume the mixes at full 75 Hz resolution; only the
+    decoder's target is pooled. Feed these to the Standardizer as well, so its
+    statistics describe the distribution the loss is actually scored against.
+    """
+    factor = loss_config.recon_pool
+    return pool_frames(content_mix, factor), pool_frames(style_mix, factor)
+
+
 def compute_losses(
     model: DisentanglementModel,
     loss_config: LossConfig,
     content: torch.Tensor,
     style: torch.Tensor,
-    content_mix: torch.Tensor,
-    style_mix: torch.Tensor,
+    content_target: torch.Tensor,
+    style_target: torch.Tensor,
     n_pairs: int,
     n_candidates: int,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """All objectives for one batch.
+
+    content_target/style_target are the *pooled* mixes from pooled_targets(),
+    so n_frames below is the pooled length and the decoder emits that many
+    frames rather than the full 75 Hz sequence.
 
     Batch layout along dim 0 (established by the train script):
         [0, P)              A-side windows of the P aligned pairs
@@ -119,16 +137,16 @@ def compute_losses(
         [P + P*K, B)        plain track windows (reconstruction only)
     """
     p, k = n_pairs, n_candidates
-    batch, n_frames = content_mix.shape[0], content_mix.shape[1]
+    batch, n_frames = content_target.shape[0], content_target.shape[1]
     device = content.device
     losses: dict[str, torch.Tensor] = {}
 
     # 2a. plain reconstruction on every window (main weight)
     pred_content, pred_style = model.decode(content, style, n_frames)
     losses["recon"] = standardized_mse(
-        pred_content, content_mix, model.content_std, loss_config.cosine_weight
+        pred_content, content_target, model.content_std, loss_config.cosine_weight
     ) + standardized_mse(
-        pred_style, style_mix, model.style_std, loss_config.cosine_weight
+        pred_style, style_target, model.style_std, loss_config.cosine_weight
     )
 
     # 1. contrastive on content tokens (MIL-NCE over the K candidates)
@@ -144,9 +162,12 @@ def compute_losses(
         b0 = p + torch.arange(p, device=device) * k  # first candidate per pair
         pred_content, pred_style = model.decode(content[:p], style[b0], n_frames)
         losses["swap"] = standardized_mse(
-            pred_content, content_mix[b0], model.content_std, loss_config.cosine_weight
+            pred_content,
+            content_target[b0],
+            model.content_std,
+            loss_config.cosine_weight,
         ) + standardized_mse(
-            pred_style, style_mix[b0], model.style_std, loss_config.cosine_weight
+            pred_style, style_target[b0], model.style_std, loss_config.cosine_weight
         )
 
     # 2c. latent cycle-consistency on a random subset with a derangement

@@ -179,9 +179,22 @@ retrying:
 |---|---|---|
 | `ok` | — | downloaded |
 | `gone` | no | link rot: unavailable, private, removed, terminated. The expected ~24% |
+| `blocked` | no | needs an account: age-restricted, members-only. Permanent here, since the pipeline downloads anonymously by design |
 | `throttled` | yes | YouTube rate-limited the session. Slow down and re-run |
 | `failed` | yes | anything else — network, extractor hiccup |
 | `filtered` | no | longer than `--max-duration` (default 900 s) |
+
+**Re-runs skip the permanent statuses.** They are read back from the log at
+startup, so a second pass targets only `throttled` and `failed` instead of
+re-confirming that a quarter of the dataset is still dead. Without that, late
+runs look like they are doing nothing but hitting unavailable videos — because
+that is exactly what they would be doing. `--retry-permanent` forces another
+attempt if you think a classification was wrong.
+
+Note that `Sign in to confirm you're not a bot` (throttling) and `Please sign
+in` / `Sign in to confirm your age` (a genuinely restricted video) both contain
+"sign in" but are opposite diagnoses, so the throttle patterns are matched
+first.
 
 **Run anonymously.** If you hit *"Sign in to confirm you're not a bot"* or
 *"The page needs to be reloaded"*, that is rate limiting, and cookies are the
@@ -225,6 +238,41 @@ Tune `--workers` upward against the `throttled` count and the `tracks/hr`
 readout the script prints, keeping the sleep on throughout. Do not trade the
 sleep away for fewer workers — that is the combination that gets blocked.
 `--player-client` is an escape hatch for forcing specific clients.
+
+#### Before uploading to S3
+
+Mixed containers are expected and need **no conversion**. yt-dlp keeps the
+native codec, so you get `.webm` (Opus, 48 kHz) and `.m4a`/`.mp4` (AAC,
+44.1 kHz) side by side — and every read path normalizes to 24 kHz mono float32
+at decode time anyway (`windows.py`, `align_covers.py`, `build_manifest.py` all
+shell out to ffmpeg). Container and source sample rate are erased before
+anything in the pipeline sees them, and `existing_audio()` keys on the filename
+stem, so the extension never enters an identity.
+
+Upload the originals unchanged. They are the archival copy, and re-acquiring
+them is the slow, rate-limited step; transcoding to a uniform 24 kHz mono codec
+would save ~3× storage (about $5/month) at the cost of a lossy→lossy generation
+and a one-way door.
+
+What is worth catching first is the small stuff that wastes bandwidth or breaks
+a preprocessing worker hours in:
+
+```bash
+python scripts/check_audio.py --split all --workers 16
+```
+
+It reports the codec/sample-rate/channel spread and flags four problems, exiting
+non-zero so it can gate an upload script:
+
+| flagged | why it happens | fix |
+|---|---|---|
+| carries a video stream | `bestaudio/best` falls back to a *combined* stream when a video has no audio-only format — many times larger for the same audio | delete, re-download |
+| unreadable | truncated or corrupt write | delete, re-download |
+| shorter than the training window | truncated download | delete, re-download |
+| leftover `.part` | interrupted download | delete; `existing_audio()` already ignores them, so they would upload as pure waste |
+
+Deleting a flagged file is enough to queue it for re-download — the resume logic
+picks up anything missing on the next run.
 
 ### 2. Chroma and cover alignment
 
@@ -397,6 +445,7 @@ scripts/
   train.py               [4] representation learning
   train_flow.py          [5] detection flows
   validate_alignment.py  alignment threshold selection
+  check_audio.py         pre-upload validation of downloaded audio
   smoke_test_*.py        fast correctness checks
 
 src/

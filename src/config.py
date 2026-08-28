@@ -58,6 +58,7 @@ class LossConfig:
     decorrelation_weight: float = 0.1
     temperature: float = 0.1  # contrastive temperature
     cosine_weight: float = 0.0  # optional cosine term in reconstruction
+    recon_pool: int = 16  # temporal pooling of the reconstruction target; 1 = off
     cycle_fraction: float = 0.5  # fraction of the batch used for 2c
     decorrelation: str = "xcorr"  # "xcorr" | "hsic"
 

@@ -1,7 +1,8 @@
 """Training objectives for the representation-learning stage (see CLAUDE.md).
 
 1. mil_nce            — contrastive loss on content tokens (K=1 -> InfoNCE)
-2. standardized_mse   — reconstruction terms 2a/2b on standardized mixes
+2. pool_frames        — temporal pooling of the reconstruction target
+   standardized_mse   — reconstruction terms 2a/2b on standardized mixes
    cycle_loss         — term 2c, decode-swap-re-encode with detached targets
 3. cross_correlation_loss / hsic_loss — content-style decorrelation
 """
@@ -17,6 +18,26 @@ from src.models.model import DisentanglementModel, Standardizer
 def pool_tokens(tokens: torch.Tensor) -> torch.Tensor:
     """(B, n_tokens, D) -> L2-normalized (B, D) for contrastive/retrieval use."""
     return F.normalize(tokens.mean(dim=1), dim=-1)
+
+
+def pool_frames(x: torch.Tensor, factor: int) -> torch.Tensor:
+    """(B, N, D) -> (B, N // factor, D), average-pooled over time.
+
+    The reconstruction target is pooled because at 75 fps most of the
+    standardized variance in MERT features is frame-to-frame detail that a
+    16x256 latent set cannot represent, which drowns the between-window signal
+    the latents *can* carry (CLAUDE.md, Decoder). Trailing frames that do not
+    fill a block are dropped. factor=1 is the ablation and is a no-op.
+
+    Pool before standardizing, never after: averaging shrinks the variance, so
+    pooling standardized values would put the target below unit variance and
+    break the "predict the dataset mean scores 1.0 per branch" yardstick.
+    """
+    if factor <= 1:
+        return x
+    return F.avg_pool1d(
+        x.transpose(1, 2), kernel_size=factor, stride=factor
+    ).transpose(1, 2)
 
 
 def mil_nce(
