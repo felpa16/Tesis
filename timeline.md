@@ -320,6 +320,227 @@ and a separate ablation.
 
 ---
 
+## 2026-08-29 — Phase-1 run #2 (pooled target) and the decision to freeze
+
+Same configuration as run #1 (7,469 tracks, 4+4 batch, 20 s windows, 10 epochs,
+21,420 steps) with `--recon-pool 16 --checkpoint-dir checkpoints/run2-pool16`.
+
+**Terminal losses**
+
+```
+recon 1.9085   contrastive 0.1660   swap 1.7909   cycle 0.0374   decorrelation 0.0557
+```
+
+**Reconstruction against the trivial predictors** (`recon_pool=16`, 93-frame target)
+
+| | run #1 | run #2 |
+|---|---|---|
+| dataset-mean baseline | 1.9526 | 2.0413 |
+| model `recon` | 1.9348 | 1.8851 |
+| per-window-mean floor | 1.8499 | 1.7851 |
+| **share of between-window range** | **17.3%** | **61.0%** |
+| decoder output std (target 1.0) | 0.085 | 0.279 |
+
+The absolute loss barely moved (1.93 -> 1.89) because **87% of the pooled
+target's variance is still within-window**. The between-window headroom went
+5.26% -> 12.55% of total variance — real, but far below the 46.5% the
+white-noise estimate predicted. MERT frames are strongly temporally correlated,
+so pooling 16 frames cut the within-window component by only ~2.4x, not 16x. A
+larger `recon_pool` is the obvious lever and costs nothing to try, but it can be
+tuned in phase 2 without re-running MERT.
+
+`cycle` rose 0.0025 -> 0.0374 (~15x), as intended: decoding at pooled resolution
+removes the unconstrained high-frequency channel that made the decode->re-encode
+path trivially invertible.
+
+### Layer mix
+
+| | run #1 | run #2 |
+|---|---|---|
+| content ‖deviation from uniform‖ | 0.0328 | 0.0330 |
+| style ‖deviation from uniform‖ | **0.0030** | **0.0217** |
+| style cos-to-uniform | 0.999884 | 0.994195 |
+| style max/min weight | 1.06x | 1.40x |
+
+**The content vector reproduced across two materially different objectives:
+cosine 0.9976 between run #1 and run #2 deviations**, same peak layers (7-10),
+same contrast. That is the strongest available evidence it reflects a property of
+MERT rather than an optimisation artifact.
+
+**Style woke up — 7.2x more contrast.** Its run-#1 shape (peaking at layers 2-5)
+is not a competing measurement that run #2 overturned; at ‖dev‖ = 0.0030 it was a
+parameter that had never moved.
+
+### The per-epoch trajectories are what settled it
+
+Rotation of each weight vector per epoch, in degrees:
+
+```
+              e1    e2    e3    e4    e5    e6    e7    e8    e9
+run1 content 2.01  1.43  1.00  0.68  0.44  0.26  0.18  0.08  0.08   monotone
+run1 style   0.14  0.00  0.00  0.14  0.24  0.24  0.21  0.14  0.08   NOT monotone
+run2 content 2.08  1.48  0.99  0.62  0.53  0.24  0.11  0.08  0.08   monotone
+run2 style   0.96  0.83  0.67  0.46  0.39  0.37  0.27  0.20  0.11   monotone
+```
+
+Run #1's style vector *wobbles* — it reads perfectly converged (0.00 degrees) at
+epochs 2-3 and then moves again. That is random drift in a parameter receiving no
+useful gradient, not annealing. Run #2's style anneals monotonically from 0.96
+to 0.11 degrees, the same shape as content.
+
+Cross-check: style's first-epoch movement grew **6.8x** from run #1 to run #2,
+independently matching the **7.2x** growth measured in the final vectors'
+deviation norms.
+
+**Methodological finding.** `log_layer_weights` computes the cosine on the
+softmax vector, which is dominated by its uniform component — so a vector pinned
+at uniform scores ~1.000000 and looks *more* converged than one that is genuinely
+learning. In run #1 style read 0.999997 at epoch 1 while content read 0.999382.
+**The freeze metric as implemented is structurally blind to the exact failure it
+exists to catch.** The sensitive version is the cosine between successive
+*deviations from uniform*. This matters for phase 2's planned sanity ablation
+(resume online training and confirm the frozen weights do not want to drift),
+which relies on this same metric.
+
+### DECISION: freeze the layer weights
+
+All three conditions of the amended criterion (`CLAUDE.md`, Feature caching) are
+met:
+
+1. **Stationarity** — both branches monotone, final epoch ~0.1 degrees.
+2. **Departure from uniform** — content 0.0330, style 0.0217 (was 0.0030).
+3. **Driving objective learning** — `recon` at 61% of the between-window range
+   (was 17%); contrastive at 0.166 against a chance level of ln(4) = 1.386.
+
+Freezing now is safe because the 50 weights are the *only* phase-1 output.
+`recon_pool`, `cosine_weight`, decoder capacity and the loss weights are all
+tunable in phase 2 without re-running MERT, since none of them change what gets
+cached. A third phase-1 run would spend 8 hours refining something phase 1 does
+not produce.
+
+### Open question for phase 2: cache one stream or two?
+
+The two branches converged on nearly the same layers. Cosine between their
+deviations went **0.39 (run #1) -> 0.93 (run #2)**; on the full vectors,
+`cos(content, style) = 0.997`. Style's only gradient is reconstruction,
+reconstruction wants maximum information, and MERT's mid-layers are the most
+information-dense — so style migrated to where content already was.
+
+This is not a failure, but `CLAUDE.md`'s ~7 TB phase-2 cache estimate assumes two
+distinct streams. **Before committing to the cache, measure the correlation
+between the two resulting mix *sequences*** (not the weight vectors — the hidden
+states are already highly correlated across layers, so the sequences will be
+closer than 0.997 suggests). Above ~0.99, cache one stream and feed both encoders
+from it: ~3.5 TB saved, and a legitimate thesis finding that the per-branch layer
+mix did not earn its keep. It should be a deliberate call, not a discovery made
+after paying for the storage.
+
+### Artifacts
+
+Saved to S3 before terminating the instance: the run-#2 checkpoint, an extracted
+`phase1_layer_weights.pt` (both weight vectors plus the standardiser buffers),
+the TensorBoard event files for both runs, and the manifests.
+
+---
+
+## 2026-09-01 — Phase-2 feature extraction: the cached unit is the window
+
+`scripts/extract_mert_features.py` materializes the phase-2 training set. It
+walks `manifests/{split}/pairs.jsonl`, samples aligned window pairs through each
+pair's warping path the way `AlignedPairDataset` does, runs frozen MERT on each
+window, applies the two softmax vectors from
+`checkpoints/run2-pool16/phase1_layer_weights.pt`, and uploads
+
+    s3://BUCKET/mert-features/{content,style}/{split}/{window_id}.npy   (N,1024) fp16
+
+`window_id` is `{track_key}_{start_ms:08d}`, so an object names the track and the
+exact offset it came from. Which windows form a pair is recorded in
+`manifests/{split}/window_pairs.jsonl` (`WindowPairEntry` in
+`src/data/manifest.py`), written locally and uploaded next to the features; that
+file is the index phase-2 training reads.
+
+### Why the window and not the track
+
+The first cut of this script cached whole tracks and assumed windows could be
+sliced out of the cached stream later. That is wrong, and the reason is worth
+keeping: **MERT features are not a local function of the audio.** Two
+independent mechanisms, both measured on this model:
+
+* **The conv frontend is `HubertGroupNormConvLayer`: `GroupNorm(groups=512,
+  channels=512)`.** One group per channel means each channel is normalised over
+  the *entire* time axis of whatever you feed it. Running the frontend on a 10 s
+  clip versus the same 10 s sitting inside a 30 s clip moves the output by a
+  per-frame cosine of **0.93** — before a single attention layer runs.
+* **The encoder is global, and context margins do not fix it.** Discarding
+  1 s / 2.5 s / 5 s of context per side gives last-layer cosines of
+  **0.85 / 0.88 / 0.92** against an unchunked forward. It converges toward 1
+  only as the margin approaches the whole input.
+
+So no track-level cache can be sliced into windows without changing the
+features, and a whole-track forward is not a meaningful target anyway: MERT was
+pretrained on ~5 s clips, and attention over 22,500 frames is both out of
+distribution and quadratic.
+
+Caching the *window* sidesteps all of it. Each cached object is one
+`MERTModel.forward` on exactly the waveform `decode_window` produces, so it is
+bit-for-bit what `scripts/train.py` computes online for that window. The
+segment-length question disappears because S is fixed at extraction time.
+
+### Design decisions
+
+* **Anchors are deterministic** — evenly spaced over the alignment points whose
+  windows fit inside *both* covers, rather than drawn at random per epoch. A
+  rerun reproduces the training set instead of resampling it, and the windows
+  cover the aligned span instead of clustering wherever the RNG landed.
+* **Windows are deduplicated across pairs.** A cover aligned against two others
+  often lands on the same offset twice; it is computed and stored once, and the
+  manifest references the id twice. In the fixture, 3 pairs x 2 windows = 12
+  slots collapsed to 8 unique windows.
+* **A window counts as cached only when both streams are in S3**, so a
+  half-finished upload is redone rather than silently leaving a one-sided
+  sample.
+* **`--s3-audio` streams the corpus instead of requiring it on the instance.**
+  ffmpeg needs a seekable input to cut a window (`-ss` before `-i`), so an S3
+  object cannot simply be piped through stdin. Work is therefore grouped by
+  source track: each track is pulled to a temp file once, every window it owes
+  is cut from it, and it is deleted — so transfer is one copy of each track in
+  the pair set (~4 MB, same-region and free), and disk high-water is
+  `--decode-workers` files, not the corpus. Sharding is by track group for the
+  same reason: two shards must never fetch the same file. Manifests and
+  alignments stay local — 88 MB for train's 20,459 `.npz`, so syncing them is
+  not the problem the audio is.
+* Resumable and shardable across GPUs; every shard writes the same manifest, so
+  training sees one coherent index no matter how the work was split.
+
+### Verified before shipping
+
+* `feature_extractor -> feature_projection -> encoder` reproduces
+  `MERTModel.forward` to **0.0** max abs difference — the staged decomposition
+  used to diagnose the GroupNorm behaviour above is sound.
+* A cached window equals `decode_window` + an online forward to within fp16
+  storage: max abs diff 0.062, **0.83% of a std** (the fp16 quantisation floor).
+* Batching windows into one forward is numerically neutral: per-frame cosine
+  0.9999999, differences at one fp16 ULP.
+* Frame accounting: 20 s -> 1,499 frames; 10 s -> 749.
+
+### Storage, and the two streams
+
+One 20 s window is 1,499 x 1024 fp16 = **3.07 MB per stream**, so a pair sample
+(two windows, two streams) is ~12.3 MB. The 8,570 surviving train pairs at
+`--windows-per-pair 4` come to **~420 GB** — an order of magnitude under the
+~7 TB the whole-track plan implied, because nothing between the sampled windows
+is stored.
+
+The script reports, per batch, the frame-wise cosine between the content mix and
+the style mix, raw and after subtracting each window's own mean frame. This is
+the measurement the run-#2 entry asked for before paying for the cache. On probe
+audio it is already **0.9999 centered**, which is what the near-uniform weight
+vectors (`cos(content, style) = 0.997`, max/min weight ratio 1.67 and 1.40)
+predict. Read it on the first ~50 real pairs with `--limit` before committing to
+two streams: above ~0.99 centered, cache one and halve the storage.
+
+---
+
 ## Open items
 
 Carried forward, not yet acted on:
@@ -333,7 +554,15 @@ Carried forward, not yet acted on:
   4-way discrimination is easy, and `n_candidates=1` means MIL-NCE degenerates to
   plain InfoNCE. The lever for a stronger signal is `--n-candidates`, not a larger
   batch.
-* `.gitignore` has a `checkpoionts/` typo, so `checkpoints/` is not actually
-  ignored, plus stray `IGNORE` lines.
+* `log_layer_weights` should also log the cosine between successive deviations
+  from uniform — the plain softmax cosine is insensitive (see run #2 entry).
+* `.gitignore`'s `checkpoionts/` typo is fixed; the stray `IGNORE` lines remain.
+* Materializing windows fixes the anchors, so phase-2 loses the per-epoch
+  resampling that online training got for free. `--windows-per-pair` is the
+  dial; whether fixed anchors cost anything measurable against online sampling
+  is untested.
+* The plain-reconstruction stream (`batch_tracks`, `TrackWindowDataset`) has no
+  cached equivalent yet — only aligned pair windows are materialized. Pair
+  windows do feed loss 2a, so this is a diversity question, not a blocker.
 * `extract_mixes`' docstring overstates what micro-batching achieves (see bug 5
   above).

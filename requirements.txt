@@ -33,6 +33,11 @@ numba>=0.67               # see note below
 # --- detection flows: src/models/flow.py ---
 zuko>=1.6                 # neural spline flows
 
+# --- S3 dataset and feature cache: scripts/extract_mert_features.py ---
+boto3>=1.34               # the AWS CLI is a separate install and is not enough:
+                          # the extractor lists, gets and puts from worker
+                          # threads, so it needs the SDK, not a subprocess
+
 # ---------------------------------------------------------------------------
 # The one dependency conflict that actually bites
 #
