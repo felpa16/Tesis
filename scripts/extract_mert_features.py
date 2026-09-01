@@ -315,6 +315,26 @@ class S3:
     def get_file(self, key: str, path: Path) -> None:
         self.client.download_file(self.bucket, key, str(path))
 
+    def exists(self, key: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+    def folders(self, prefix: str = "") -> list[str]:
+        """Immediate 'subdirectories' of a prefix, for diagnosing key layout."""
+        page = self.client.list_objects_v2(
+            Bucket=self.bucket, Prefix=prefix, Delimiter="/", MaxKeys=200
+        )
+        return [p["Prefix"] for p in page.get("CommonPrefixes", ())]
+
+    def sample(self, prefix: str, limit: int = 3) -> list[str]:
+        page = self.client.list_objects_v2(
+            Bucket=self.bucket, Prefix=prefix, MaxKeys=limit
+        )
+        return [o["Key"] for o in page.get("Contents", ())]
+
 
 # --------------------------------------------------------------------------
 # Audio source
@@ -336,33 +356,50 @@ class AudioSource:
         self,
         data_root: Path,
         s3: "S3 | None",
-        prefix: str,
+        key_template: str,
+        split: str,
         tmp_dir: Path | None,
     ) -> None:
         self.data_root = data_root
         self.s3 = s3
-        self.prefix = prefix.strip("/")
+        self.key_template = key_template
+        self.split = split
         self.tmp_dir = tmp_dir
         self.fetched = 0
         self.bytes_in = 0
         self._lock = threading.Lock()
 
-    def object_key(self, relative: str) -> str:
-        """Manifest paths are relative to the data root; S3 mirrors that layout."""
-        return f"{self.prefix}/{relative}" if self.prefix else relative
+    def object_key(self, window: Window) -> str:
+        """Build the S3 key for a track from --audio-key.
+
+        The default "{path}" reuses the manifest's own relative path, which
+        assumes the bucket mirrors the data root. Buckets that don't -- audio
+        at "train/KEY.ext" rather than "audio/train/KEY.ext", say -- are one
+        template away rather than unreachable.
+        """
+        return self.key_template.format(
+            path=window.audio,
+            split=self.split,
+            track=window.key,
+            key=window.key,  # alias: "key" is overloaded, {track} is clearer
+            ext=Path(window.audio).suffix,
+        )
 
     @contextlib.contextmanager
-    def open(self, relative: str):
-        local = self.data_root / relative
+    def open(self, window: Window):
+        local = self.data_root / window.audio
         if local.exists() or self.s3 is None:
             yield local
             return
-        suffix = Path(relative).suffix
-        handle, name = tempfile.mkstemp(suffix=suffix, dir=self.tmp_dir)
+        key = self.object_key(window)
+        handle, name = tempfile.mkstemp(suffix=Path(window.audio).suffix, dir=self.tmp_dir)
         os.close(handle)
         path = Path(name)
         try:
-            self.s3.get_file(self.object_key(relative), path)
+            try:
+                self.s3.get_file(key, path)
+            except Exception as exc:  # name the key: a bare 404 says nothing
+                raise RuntimeError(f"s3://{self.s3.bucket}/{key}: {exc}") from exc
             with self._lock:
                 self.fetched += 1
                 self.bytes_in += path.stat().st_size
@@ -530,10 +567,13 @@ def main() -> None:
         "still read locally (88 MB for train, so sync those).",
     )
     parser.add_argument(
-        "--audio-prefix",
-        default="",
-        help="S3 prefix in front of the manifest's audio paths; empty means "
-        "the bucket mirrors the data root (audio/{split}/KEY.ext)",
+        "--audio-key",
+        default="{path}",
+        help="template for the S3 object key of a track. Fields: {path} (the "
+        "manifest's own path, e.g. audio/train/10154_10161.webm), {split}, "
+        "{track} (e.g. 10154_10161), {ext} (e.g. .webm). The default assumes "
+        "the bucket mirrors the data root; use '{split}/{track}{ext}' when the "
+        "audio sits at the top level of the bucket.",
     )
     parser.add_argument(
         "--tmp-dir",
@@ -669,7 +709,8 @@ def main() -> None:
     source = AudioSource(
         args.data_root,
         s3 if args.s3_audio else None,
-        args.audio_prefix,
+        args.audio_key,
+        args.split,
         args.tmp_dir,
     )
     if not args.s3_audio:
@@ -683,11 +724,38 @@ def main() -> None:
                 f"instead of downloading the corpus."
             )
     else:
+        # Probe one object before spinning up the pools. Without this a wrong
+        # key layout costs a full pass to discover and reports N identical
+        # 404s with no mention of the key that was actually requested.
+        probe = groups[0][0]
+        probe_key = source.object_key(probe)
+        if not s3.exists(probe_key):
+            lines = [
+                f"no such object: s3://{args.bucket}/{probe_key}",
+                "",
+                f"That key came from --audio-key {args.audio_key!r} applied to "
+                f"track {probe.key} (manifest path {probe.audio}).",
+                "",
+                f"Top level of s3://{args.bucket}/:",
+            ]
+            lines += [f"    {f}" for f in s3.folders() or ["    (no folders)"]]
+            for candidate in (f"{args.split}/", f"audio/{args.split}/"):
+                found = s3.sample(candidate)
+                if found:
+                    lines += [f"Objects under {candidate}:"]
+                    lines += [f"    {k}" for k in found]
+            lines += [
+                "",
+                "Set --audio-key to match. Common layouts:",
+                "    bucket mirrors the data root   --audio-key '{path}'",
+                "    audio at the top level         --audio-key '{split}/{track}{ext}'",
+                "    audio under another folder     --audio-key 'raw/{split}/{track}{ext}'",
+            ]
+            raise SystemExit("\n".join(lines))
         print(
-            f"streaming audio from s3://{args.bucket}/"
-            f"{source.object_key('audio/' + args.split)}/ "
-            f"({len(groups)} track fetches, staged in "
-            f"{args.tmp_dir or tempfile.gettempdir()})"
+            f"streaming audio from s3://{args.bucket}/{probe_key} "
+            f"(pattern {args.audio_key!r}; {len(groups)} track fetches, staged "
+            f"in {args.tmp_dir or tempfile.gettempdir()})"
         )
 
     autocast = (
@@ -700,7 +768,7 @@ def main() -> None:
 
     def fetch(group: list[Window]) -> list[tuple[str, torch.Tensor]]:
         """One track: open it once, cut every window it owes, release it."""
-        with source.open(group[0].audio) as path:
+        with source.open(group[0]) as path:
             return [
                 (w.window_id, decode_window(path, w.start, window_config))
                 for w in group
