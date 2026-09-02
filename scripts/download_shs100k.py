@@ -9,6 +9,11 @@ Audio-only streams are saved as data/audio/{split}/{work_id}_{performance_id}.<e
 script is safe to interrupt and re-run. Outcomes are appended to a CSV log,
 classified so a re-run can target the retryable failures and ignore link rot.
 
+Once a split has been uploaded to S3 and deleted locally, that folder is empty
+and a plain re-run would fetch everything again. --using-csv reads the already-
+downloaded keys from data/logs/{split}_downloaded_songs.csv instead, which
+scripts/list_downloaded_songs.py writes while the files are still on disk.
+
 Run anonymously. Passing cookies switches yt-dlp to a different, more heavily
 policed set of player clients and usually makes yield *worse* -- see the
 --cookies-from-browser help text.
@@ -41,6 +46,8 @@ from shs100k_meta import (  # noqa: E402
     SPLITS,
     Track,
     audio_dir,
+    audio_from_csv,
+    downloaded_csv,
     existing_audio,
     split_tracks,
 )
@@ -60,7 +67,8 @@ GONE_MARKERS = (
 )
 
 # Errors that mean YouTube is throttling this session. Not permanent: they are
-# fixed by slowing down, never by authenticating.
+# fixed by slowing down, never by authenticating. Checked BEFORE the login
+# markers below, because the bot-check message also contains "sign in".
 THROTTLE_MARKERS = (
     "not a bot",
     "needs to be reloaded",
@@ -68,6 +76,28 @@ THROTTLE_MARKERS = (
     "http error 429",
     "rate-limited",
 )
+
+# Errors that need an account: age-restricted, members-only, private-with-access.
+# Permanent for us, since this pipeline downloads anonymously on purpose --
+# cookies switch yt-dlp to the policed player clients and make yield worse.
+LOGIN_MARKERS = (
+    "please sign in",
+    "confirm your age",
+    "age-restricted",
+    "members-only",
+    "join this channel",
+    "available to this channel's members",
+    "inappropriate for some users",
+)
+
+# Statuses that will never succeed on a re-run, so they are skipped next time.
+PERMANENT = ("gone", "blocked", "filtered")
+
+# Link rot in SHS100K runs ~24%. A run far above that is not finding dead
+# videos: a flagged IP gets served "Video unavailable" for perfectly healthy
+# ones, which is indistinguishable from real link rot in the error text. Above
+# this fraction the classifications are not trustworthy and must not be baked in.
+SOFT_BLOCK_RATE = 0.50
 
 
 @dataclass(frozen=True)
@@ -95,13 +125,33 @@ class DownloadOptions:
 
 
 def classify(error: str) -> str:
-    """'gone' (permanent), 'throttled', or 'failed' (retryable) for an error."""
+    """Bucket an error: gone/blocked are permanent, throttled/failed retryable."""
     lowered = error.lower()
-    if any(marker in lowered for marker in GONE_MARKERS):
-        return "gone"
     if any(marker in lowered for marker in THROTTLE_MARKERS):
         return "throttled"
+    if any(marker in lowered for marker in GONE_MARKERS):
+        return "gone"
+    if any(marker in lowered for marker in LOGIN_MARKERS):
+        return "blocked"
     return "failed"
+
+
+def permanent_failures(log_path: Path) -> set[str]:
+    """Keys whose most recent logged outcome can never succeed on a re-run.
+
+    Without this, every run retries the whole link-rot tail -- about 24% of the
+    dataset -- so late runs spend nearly all their time re-confirming that dead
+    videos are still dead. Columns 0 and 2 are key and status in both the
+    current log format and the older four-column one, so old logs still parse.
+    """
+    if not log_path.exists():
+        return set()
+    latest: dict[str, str] = {}
+    with open(log_path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) >= 3 and row[0] != "key":
+                latest[row[0]] = row[2]
+    return {key for key, status in latest.items() if status in PERMANENT}
 
 
 def build_ydl_opts(out_dir: Path, key: str, options: DownloadOptions) -> dict:
@@ -163,7 +213,13 @@ def download_one(
 
 
 def run_split(
-    split: str, data_root: Path, workers: int, limit: int, options: DownloadOptions
+    split: str,
+    data_root: Path,
+    workers: int,
+    limit: int,
+    options: DownloadOptions,
+    retry_permanent: bool = False,
+    using_csv: bool = False,
 ) -> None:
     out_dir = audio_dir(data_root, split)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -172,15 +228,29 @@ def run_split(
     log_path = log_dir / f"download_{split}.csv"
 
     tracks = split_tracks(split)
-    done = existing_audio(data_root, split)
-    todo = [t for t in tracks if t.key not in done]
+    if using_csv:
+        done = audio_from_csv(data_root, split)
+        source = downloaded_csv(data_root, split)
+    else:
+        done = existing_audio(data_root, split)
+        source = out_dir
+    skip = set() if retry_permanent else permanent_failures(log_path)
+    todo = [t for t in tracks if t.key not in done and t.key not in skip]
     if limit > 0:
         todo = todo[:limit]
     print(
-        f"[{split}] {len(tracks)} tracks in split, {len(done)} already downloaded, "
+        f"[{split}] {len(tracks)} tracks in split, {len(done)} already downloaded "
+        f"(per {source}), {len(skip)} permanently unavailable, "
         f"{len(todo)} to fetch"
     )
     if not todo:
+        reachable = len(done) + len(skip)
+        if reachable >= len(tracks):
+            print(
+                f"[{split}] split complete: {len(done)} downloaded "
+                f"({len(done) / max(len(tracks), 1):.0%} yield), {len(skip)} "
+                f"permanently unavailable. Nothing left to retry."
+            )
         return
     pacing = f"{options.sleep_requests:g}s between requests"
     if options.sleep_interval > 0:
@@ -191,7 +261,9 @@ def run_split(
     print(f"[{split}] {workers} workers, {pacing}")
     started = time.monotonic()
 
-    counts = {"ok": 0, "gone": 0, "throttled": 0, "failed": 0, "filtered": 0}
+    counts = {
+        "ok": 0, "gone": 0, "blocked": 0, "throttled": 0, "failed": 0, "filtered": 0
+    }
     write_header = not log_path.exists()
     with open(log_path, "a", newline="", encoding="utf-8") as log_file:
         log = csv.writer(log_file)
@@ -207,7 +279,7 @@ def run_split(
                 status, detail = future.result()
                 counts[status] += 1
                 if status != "ok":
-                    retryable = "no" if status in ("gone", "filtered") else "yes"
+                    retryable = "no" if status in PERMANENT else "yes"
                     log.writerow([track.key, track.url, status, retryable, detail])
                     log_file.flush()
                 if i % 50 == 0 or i == len(todo):
@@ -220,7 +292,8 @@ def run_split(
                         )
 
     rate = len(todo) / max(time.monotonic() - started, 1e-9) * 3600
-    remaining = len(tracks) - len(done) - counts["ok"]
+    permanent = counts["gone"] + counts["blocked"] + counts["filtered"]
+    remaining = len(tracks) - len(done) - len(skip) - counts["ok"] - permanent
     print(f"[{split}] done: {counts}  (logged to {log_path})")
     print(
         f"[{split}] {rate:.0f} tracks/hr sustained ({rate / 3600:.2f} req/s); "
@@ -228,6 +301,27 @@ def run_split(
         f"{remaining / max(rate, 1e-9) / 24:.1f} days. To go faster raise "
         f"--workers and keep the sleep on; watch 'throttled'."
     )
+    attempted = len(todo)
+    if permanent and attempted >= 20 and permanent / attempted > SOFT_BLOCK_RATE:
+        print(
+            f"\n[{split}] !! {permanent}/{attempted} "
+            f"({permanent / attempted:.0%}) came back unavailable. Link rot is "
+            f"~24%, so this is almost certainly an IP-level SOFT BLOCK, not dead "
+            f"videos: YouTube serves 'Video unavailable' for healthy videos when "
+            f"it has flagged your address.\n"
+            f"[{split}]    Verify by opening one of the failed video ids in a "
+            f"browser. If it plays, these classifications are wrong.\n"
+            f"[{split}]    Do NOT let them stick: stop, wait several hours, then "
+            f"resume with --retry-permanent so they are attempted again. "
+            f"Continuing now will blacklist good tracks.\n"
+        )
+    elif permanent:
+        print(
+            f"[{split}] {permanent} newly confirmed unavailable "
+            f"({counts['gone']} gone, {counts['blocked']} need an account, "
+            f"{counts['filtered']} filtered); they will be skipped from now on. "
+            f"Use --retry-permanent to force another attempt."
+        )
     if counts["throttled"]:
         print(
             f"[{split}] {counts['throttled']} downloads were rate-limited by "
@@ -253,6 +347,23 @@ def main() -> None:
     )
     parser.add_argument(
         "--retries", type=int, default=3, help="yt-dlp retries per download"
+    )
+    parser.add_argument(
+        "--using-csv",
+        action="store_true",
+        help="decide what is already downloaded from "
+        "data/logs/{split}_downloaded_songs.csv (written by "
+        "scripts/list_downloaded_songs.py) instead of listing the audio "
+        "folder. For resuming after the audio has been moved off this disk; "
+        "newly downloaded files are NOT added to the CSV, so re-run the "
+        "listing script after an upload",
+    )
+    parser.add_argument(
+        "--retry-permanent",
+        action="store_true",
+        help="also retry tracks previously logged as gone/blocked/filtered. "
+        "Off by default: those are the ~24%% link-rot tail and retrying them "
+        "makes every later run slower without finding anything",
     )
     parser.add_argument(
         "--sleep-requests",
@@ -319,7 +430,15 @@ def main() -> None:
 
     splits = list(SPLITS) if args.split == "all" else [args.split]
     for split in splits:
-        run_split(split, args.data_root, args.workers, args.limit, options)
+        run_split(
+            split,
+            args.data_root,
+            args.workers,
+            args.limit,
+            options,
+            args.retry_permanent,
+            args.using_csv,
+        )
 
 
 if __name__ == "__main__":

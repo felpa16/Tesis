@@ -228,3 +228,35 @@ def existing_audio(data_root: Path, split: str) -> dict[str, Path]:
         if path.is_file() and not path.name.startswith(".") and ".part" not in path.name:
             files[path.stem] = path
     return files
+
+
+def downloaded_csv(data_root: Path, split: str) -> Path:
+    """Snapshot of the audio file names downloaded for a split.
+
+    Written by scripts/list_downloaded_songs.py and read by the downloader's
+    --using-csv mode, which needs it once the audio has left the local disk
+    (uploaded to S3, moved elsewhere) and audio_dir() no longer answers the
+    "did we already download this?" question.
+    """
+    return data_root / "logs" / f"{split}_downloaded_songs.csv"
+
+
+def audio_from_csv(data_root: Path, split: str) -> set[str]:
+    """Track keys listed in the split's downloaded-songs CSV.
+
+    Each line holds one file name ("221685_927680.webm"); the key is its stem.
+    A stray header or a name that is not a track key simply yields a key that
+    matches no track, so it costs nothing and is left in.
+    """
+    path = downloaded_csv(data_root, split)
+    if not path.exists():
+        raise SystemExit(
+            f"no downloaded-songs CSV at {path}. Write one first:\n"
+            f"    python scripts/list_downloaded_songs.py --{split}"
+        )
+    keys: set[str] = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if row and row[0].strip():
+                keys.add(Path(row[0].strip()).stem)
+    return keys
