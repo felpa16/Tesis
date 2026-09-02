@@ -1,7 +1,9 @@
 'IGNORE'
 CLAUDE.md
 .claude
-data/
+data/audio
+data/chroma
+data/manifests
 checkpoionts/
 runs/
 __pycache__/
