@@ -125,7 +125,10 @@ class TrainConfig:
     checkpoint_every: int = 500  # steps; 0 = only at epoch end
     log_every: int = 10  # steps
     freeze_layer_weights: bool = False  # phase-1 freeze switch
+    layer_weights: str = ""  # phase-1 layer-weights file to start the mixes from
     standardizer_momentum: float = 0.99
+    val_every: int = 0  # steps between validations; 0 = at each epoch end
+    select_metric: str = "val/total"  # validation metric that picks best.pt
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

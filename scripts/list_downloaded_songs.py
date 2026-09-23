@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Write a CSV listing the audio files already downloaded for one split.
+"""Append the audio files found on disk to a split's downloaded-songs CSV.
 
 The downloader normally decides what to skip by looking at data/audio/{split}.
 That only works while the audio is sitting on the same machine: once a split has
 been uploaded to S3 (or moved to an external disk) the folder is empty and a
-re-run would download everything again. This script snapshots the file names
-while they are still reachable, so the downloader can be pointed at the snapshot
-instead -- see `download_shs100k.py --using-csv`.
+re-run would download everything again. This script records the file names while
+they are still reachable, so the downloader can be pointed at the CSV instead --
+see `download_shs100k.py --using-csv`.
+
+The CSV is only ever appended to, never rewritten. It is the record of
+everything ever downloaded, which quickly outgrows what the folder holds: after
+an upload-and-delete cycle the audio folder is a small tail of the CSV, so
+overwriting it would drop the history and re-download thousands of tracks.
+Lines already present are left untouched and files already listed are skipped,
+so re-running is harmless.
 
 Output: data/logs/{split}_downloaded_songs.csv, one file name per line
-(no header), sorted, e.g.
+(no header), in the order the files were appended, e.g.
 
     221685_927680.webm
     221685_927681.m4a
@@ -34,6 +41,7 @@ from shs100k_meta import (  # noqa: E402
     DEFAULT_DATA_ROOT,
     audio_dir,
     downloaded_csv,
+    keys_from_csv,
 )
 
 
@@ -54,12 +62,43 @@ def audio_files(directory: Path) -> list[Path]:
     return sorted(files, key=lambda path: path.name)
 
 
-def write_listing(files: list[Path], out_path: Path) -> None:
+def ends_without_newline(path: Path) -> bool:
+    """Whether a non-empty file's last byte is not a line break.
+
+    Appending to such a file would glue the first new name onto the last
+    existing one, silently corrupting both rows.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with open(path, "rb") as f:
+        f.seek(-1, 2)
+        return f.read(1) not in (b"\n", b"\r")
+
+
+def append_listing(files: list[Path], out_path: Path) -> list[Path]:
+    """Append the files the CSV does not list yet. Returns what was appended.
+
+    Dedup is by track key rather than file name, so a track re-downloaded into
+    a different container (.webm the first time, .m4a the second) is not listed
+    twice under two names.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+    listed = keys_from_csv(out_path)
+    new: list[Path] = []
+    for path in files:
+        if path.stem not in listed:
+            listed.add(path.stem)
+            new.append(path)
+    if not new:
+        return []
+
+    with open(out_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        for path in files:
+        if ends_without_newline(out_path):
+            f.write("\r\n")
+        for path in new:
             writer.writerow([path.name])
+    return new
 
 
 def main() -> None:
@@ -85,21 +124,25 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="output CSV (default: --data-root/logs/{split}_downloaded_songs.csv)",
+        help="CSV to append to "
+        "(default: --data-root/logs/{split}_downloaded_songs.csv)",
     )
     args = parser.parse_args()
 
     directory = args.audio_dir or audio_dir(args.data_root, args.split)
     out_path = args.out or downloaded_csv(args.data_root, args.split)
 
+    before = len(keys_from_csv(out_path))
     files = audio_files(directory)
-    write_listing(files, out_path)
+    appended = append_listing(files, out_path)
 
-    keys = {path.stem for path in files}
-    duplicates = len(files) - len(keys)
+    duplicates = len(files) - len({path.stem for path in files})
     note = f", {duplicates} sharing a track key" if duplicates else ""
     print(f"[{args.split}] {len(files)} files in {directory}{note}")
-    print(f"[{args.split}] wrote {out_path}")
+    print(
+        f"[{args.split}] appended {len(appended)} new names to {out_path} "
+        f"({before} already listed, {before + len(appended)} total)"
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,420 @@
+{
+ "description": "Fixed evaluation works, drawn from the official SHS100K validate and test splits (never train) by scripts/designate_eval_works.py. n_tracks is the downloaded count at designation time.",
+ "created": "2026-09-18",
+ "seed": 0,
+ "min_tracks": 10,
+ "pool": [
+  "val",
+  "test"
+ ],
+ "splits": {
+  "val50": {
+   "works": {
+    "2363": {
+     "source": "test",
+     "n_tracks": 59
+    },
+    "5854": {
+     "source": "test",
+     "n_tracks": 11
+    },
+    "7261": {
+     "source": "val",
+     "n_tracks": 68
+    },
+    "8855": {
+     "source": "test",
+     "n_tracks": 33
+    },
+    "9024": {
+     "source": "val",
+     "n_tracks": 19
+    },
+    "9118": {
+     "source": "val",
+     "n_tracks": 112
+    },
+    "10352": {
+     "source": "test",
+     "n_tracks": 23
+    },
+    "10851": {
+     "source": "val",
+     "n_tracks": 450
+    },
+    "12537": {
+     "source": "test",
+     "n_tracks": 28
+    },
+    "17026": {
+     "source": "val",
+     "n_tracks": 28
+    },
+    "26839": {
+     "source": "test",
+     "n_tracks": 106
+    },
+    "29257": {
+     "source": "test",
+     "n_tracks": 91
+    },
+    "41134": {
+     "source": "test",
+     "n_tracks": 21
+    },
+    "52177": {
+     "source": "test",
+     "n_tracks": 316
+    },
+    "52950": {
+     "source": "test",
+     "n_tracks": 48
+    },
+    "57631": {
+     "source": "test",
+     "n_tracks": 63
+    },
+    "69383": {
+     "source": "test",
+     "n_tracks": 42
+    },
+    "70382": {
+     "source": "test",
+     "n_tracks": 30
+    },
+    "74307": {
+     "source": "test",
+     "n_tracks": 25
+    },
+    "78391": {
+     "source": "test",
+     "n_tracks": 19
+    },
+    "80667": {
+     "source": "test",
+     "n_tracks": 37
+    },
+    "113622": {
+     "source": "val",
+     "n_tracks": 31
+    },
+    "117811": {
+     "source": "test",
+     "n_tracks": 38
+    },
+    "118379": {
+     "source": "val",
+     "n_tracks": 88
+    },
+    "118713": {
+     "source": "test",
+     "n_tracks": 129
+    },
+    "122137": {
+     "source": "test",
+     "n_tracks": 48
+    },
+    "123077": {
+     "source": "test",
+     "n_tracks": 27
+    },
+    "124690": {
+     "source": "test",
+     "n_tracks": 34
+    },
+    "126024": {
+     "source": "val",
+     "n_tracks": 24
+    },
+    "131787": {
+     "source": "test",
+     "n_tracks": 43
+    },
+    "134324": {
+     "source": "test",
+     "n_tracks": 32
+    },
+    "135613": {
+     "source": "test",
+     "n_tracks": 25
+    },
+    "136393": {
+     "source": "test",
+     "n_tracks": 42
+    },
+    "146553": {
+     "source": "test",
+     "n_tracks": 30
+    },
+    "149825": {
+     "source": "test",
+     "n_tracks": 56
+    },
+    "153251": {
+     "source": "test",
+     "n_tracks": 57
+    },
+    "164257": {
+     "source": "val",
+     "n_tracks": 22
+    },
+    "184434": {
+     "source": "test",
+     "n_tracks": 56
+    },
+    "198645": {
+     "source": "test",
+     "n_tracks": 32
+    },
+    "202253": {
+     "source": "test",
+     "n_tracks": 20
+    },
+    "209856": {
+     "source": "test",
+     "n_tracks": 22
+    },
+    "221685": {
+     "source": "test",
+     "n_tracks": 19
+    },
+    "222249": {
+     "source": "test",
+     "n_tracks": 23
+    },
+    "224254": {
+     "source": "val",
+     "n_tracks": 11
+    },
+    "228669": {
+     "source": "test",
+     "n_tracks": 25
+    },
+    "245454": {
+     "source": "test",
+     "n_tracks": 26
+    },
+    "267286": {
+     "source": "test",
+     "n_tracks": 23
+    },
+    "315029": {
+     "source": "test",
+     "n_tracks": 32
+    },
+    "318160": {
+     "source": "test",
+     "n_tracks": 18
+    },
+    "319620": {
+     "source": "test",
+     "n_tracks": 19
+    }
+   }
+  },
+  "test50": {
+   "works": {
+    "303": {
+     "source": "test",
+     "n_tracks": 110
+    },
+    "2463": {
+     "source": "test",
+     "n_tracks": 33
+    },
+    "4964": {
+     "source": "test",
+     "n_tracks": 23
+    },
+    "5363": {
+     "source": "test",
+     "n_tracks": 110
+    },
+    "6425": {
+     "source": "test",
+     "n_tracks": 16
+    },
+    "7865": {
+     "source": "val",
+     "n_tracks": 28
+    },
+    "9606": {
+     "source": "test",
+     "n_tracks": 20
+    },
+    "10159": {
+     "source": "val",
+     "n_tracks": 57
+    },
+    "11552": {
+     "source": "val",
+     "n_tracks": 856
+    },
+    "13353": {
+     "source": "test",
+     "n_tracks": 54
+    },
+    "20257": {
+     "source": "test",
+     "n_tracks": 161
+    },
+    "21138": {
+     "source": "val",
+     "n_tracks": 23
+    },
+    "21528": {
+     "source": "test",
+     "n_tracks": 91
+    },
+    "25034": {
+     "source": "test",
+     "n_tracks": 33
+    },
+    "37243": {
+     "source": "test",
+     "n_tracks": 21
+    },
+    "50485": {
+     "source": "test",
+     "n_tracks": 36
+    },
+    "52878": {
+     "source": "val",
+     "n_tracks": 40
+    },
+    "60283": {
+     "source": "test",
+     "n_tracks": 60
+    },
+    "60515": {
+     "source": "test",
+     "n_tracks": 43
+    },
+    "70084": {
+     "source": "val",
+     "n_tracks": 54
+    },
+    "97790": {
+     "source": "val",
+     "n_tracks": 58
+    },
+    "112942": {
+     "source": "val",
+     "n_tracks": 40
+    },
+    "116397": {
+     "source": "val",
+     "n_tracks": 58
+    },
+    "116532": {
+     "source": "test",
+     "n_tracks": 12
+    },
+    "118061": {
+     "source": "test",
+     "n_tracks": 167
+    },
+    "121366": {
+     "source": "test",
+     "n_tracks": 30
+    },
+    "131283": {
+     "source": "val",
+     "n_tracks": 24
+    },
+    "142497": {
+     "source": "val",
+     "n_tracks": 43
+    },
+    "145752": {
+     "source": "test",
+     "n_tracks": 23
+    },
+    "155629": {
+     "source": "test",
+     "n_tracks": 25
+    },
+    "159584": {
+     "source": "test",
+     "n_tracks": 19
+    },
+    "163725": {
+     "source": "test",
+     "n_tracks": 24
+    },
+    "165411": {
+     "source": "test",
+     "n_tracks": 32
+    },
+    "167179": {
+     "source": "test",
+     "n_tracks": 11
+    },
+    "167658": {
+     "source": "val",
+     "n_tracks": 22
+    },
+    "172590": {
+     "source": "test",
+     "n_tracks": 20
+    },
+    "185763": {
+     "source": "test",
+     "n_tracks": 19
+    },
+    "186755": {
+     "source": "test",
+     "n_tracks": 30
+    },
+    "209828": {
+     "source": "val",
+     "n_tracks": 26
+    },
+    "226310": {
+     "source": "test",
+     "n_tracks": 27
+    },
+    "241162": {
+     "source": "val",
+     "n_tracks": 68
+    },
+    "267181": {
+     "source": "test",
+     "n_tracks": 29
+    },
+    "288259": {
+     "source": "test",
+     "n_tracks": 45
+    },
+    "300465": {
+     "source": "val",
+     "n_tracks": 26
+    },
+    "316325": {
+     "source": "test",
+     "n_tracks": 73
+    },
+    "316712": {
+     "source": "test",
+     "n_tracks": 31
+    },
+    "317586": {
+     "source": "test",
+     "n_tracks": 36
+    },
+    "317944": {
+     "source": "test",
+     "n_tracks": 30
+    },
+    "319232": {
+     "source": "test",
+     "n_tracks": 18
+    },
+    "320315": {
+     "source": "val",
+     "n_tracks": 23
+    }
+   }
+  }
+ }
+}

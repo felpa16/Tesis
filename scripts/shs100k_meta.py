@@ -25,12 +25,20 @@ HELD_OUT_AGAINST and `split_tracks`.
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = REPO_ROOT / "shs-100k"
 DEFAULT_DATA_ROOT = REPO_ROOT / "data"
+
+# Designated evaluation splits (written by scripts/designate_eval_works.py and
+# committed): each is a fixed list of works drawn from the official held-out
+# splits, so it never shrinks the training set. Storage (audio/, chroma/,
+# alignments/) stays organized by the official split a work came from; only
+# the manifest under manifests/{name}/ gathers a designated split together.
+EVAL_WORKS_FILE = REPO_ROOT / "splits" / "eval_works.json"
 
 YOUTUBE_URL = "https://youtube.com/watch?v={video_id}"
 
@@ -206,6 +214,28 @@ def split_songs(split: str, drop_leaked: bool = True) -> dict[int, list[Track]]:
     return songs
 
 
+def designated_splits(path: Path = EVAL_WORKS_FILE) -> dict[str, dict[int, str]]:
+    """Designated evaluation splits: name -> {work id: source split}.
+
+    Empty when no designation file exists yet. The source split names the
+    official split the work (and hence its audio, chroma and alignments)
+    belongs to.
+    """
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        name: {int(work): entry["source"] for work, entry in spec["works"].items()}
+        for name, spec in data["splits"].items()
+    }
+
+
+def selection_path(data_root: Path, split: str, kept_per_song: int) -> Path:
+    """Per-work list of the aligned pairs chosen by `align_covers.py --kept-per-song`."""
+    return alignment_dir(data_root, split) / f"selection_k{kept_per_song}.json"
+
+
 def audio_dir(data_root: Path, split: str) -> Path:
     return data_root / "audio" / split
 
@@ -241,12 +271,28 @@ def downloaded_csv(data_root: Path, split: str) -> Path:
     return data_root / "logs" / f"{split}_downloaded_songs.csv"
 
 
-def audio_from_csv(data_root: Path, split: str) -> set[str]:
-    """Track keys listed in the split's downloaded-songs CSV.
+def keys_from_csv(path: Path) -> set[str]:
+    """Track keys listed in a downloaded-songs CSV; empty if it does not exist.
 
     Each line holds one file name ("221685_927680.webm"); the key is its stem.
     A stray header or a name that is not a track key simply yields a key that
     matches no track, so it costs nothing and is left in.
+    """
+    if not path.exists():
+        return set()
+    keys: set[str] = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if row and row[0].strip():
+                keys.add(Path(row[0].strip()).stem)
+    return keys
+
+
+def audio_from_csv(data_root: Path, split: str) -> set[str]:
+    """Track keys listed in the split's downloaded-songs CSV.
+
+    A missing CSV is fatal here: the caller decides what to download from this
+    set, and silently treating it as empty would re-fetch the whole split.
     """
     path = downloaded_csv(data_root, split)
     if not path.exists():
@@ -254,9 +300,4 @@ def audio_from_csv(data_root: Path, split: str) -> set[str]:
             f"no downloaded-songs CSV at {path}. Write one first:\n"
             f"    python scripts/list_downloaded_songs.py --{split}"
         )
-    keys: set[str] = set()
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.reader(f):
-            if row and row[0].strip():
-                keys.add(Path(row[0].strip()).stem)
-    return keys
+    return keys_from_csv(path)

@@ -9,9 +9,22 @@ latent cycle-consistency (2c), and content-style decorrelation (3).
 Layer-mix weights are logged every epoch together with their cosine
 similarity to the previous epoch — the phase-1 freeze criterion. Once they
 stabilize, rerun with --freeze-layer-weights (or move to phase-2 caching).
+--layer-weights starts both mixes from the file phase 1 froze, so a fresh run
+with --freeze-layer-weights trains the encoders on the chosen layers, not on a
+uniform average.
+
+Validation runs every --val-every steps (default: each epoch end). Each
+validation appends to {checkpoint_dir}/val_metrics.jsonl, together with the
+mean training losses since the previous one, and best.pt keeps the checkpoint
+with the best --select-metric. With --max-steps the run always reaches that
+many steps, taking as many epochs as the training set needs, so runs on
+subsets of different sizes get the same budget.
 
 Examples:
     python scripts/train.py --train-split train --val-split val
+    python scripts/train.py --train-split train_w25 --val-split val50 \
+        --layer-weights phase1_layer_weights.pt --freeze-layer-weights \
+        --max-steps 45000 --val-every 2500 --checkpoint-dir checkpoints/lc-w25
     # local smoke run:
     python scripts/train.py --train-split val --val-split val \
         --window-seconds 5 --batch-pairs 2 --batch-tracks 2 \
@@ -21,6 +34,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import random
 import sys
 import time
@@ -31,7 +46,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -48,10 +63,12 @@ from src.data import (  # noqa: E402
     read_tracks,
 )
 from src.losses import pool_tokens  # noqa: E402
+from src.metrics import content_retrieval  # noqa: E402
 from src.models import DisentanglementModel, MertExtractor  # noqa: E402
 from src.training import (  # noqa: E402
     compute_losses,
     extract_mixes,
+    load_layer_weights,
     make_optimizer,
     make_scheduler,
     pick_device,
@@ -113,8 +130,17 @@ def build_val_loader(config: TrainConfig, data_root: Path) -> DataLoader | None:
     )
     if len(dataset) == 0:
         return None
+    # Manifests list a work's pairs contiguously, so batches in file order hold
+    # one work each and every in-batch negative would be a masked same-work
+    # pair. A fixed seeded permutation mixes works and is identical at every
+    # validation, and across runs with the same seed.
+    order = torch.randperm(
+        len(dataset), generator=torch.Generator().manual_seed(config.seed)
+    ).tolist()
     # num_workers=0 so seeding `random` makes the sampled windows reproducible
-    return DataLoader(dataset, batch_size=config.data.batch_pairs, num_workers=0)
+    return DataLoader(
+        Subset(dataset, order), batch_size=config.data.batch_pairs, num_workers=0
+    )
 
 
 def repeat_forever(loader: DataLoader):
@@ -135,6 +161,13 @@ def assemble_waves(
     return torch.cat(parts).to(device), p, k
 
 
+def pair_song_ids(pair_batch: dict, device: torch.device) -> torch.Tensor:
+    """(P,) work id of each aligned pair in a batch, read off its track key."""
+    return torch.tensor(
+        [int(key.split("_")[0]) for key in pair_batch["key_a"]], device=device
+    )
+
+
 @torch.no_grad()
 def validate(
     mert: MertExtractor,
@@ -142,13 +175,23 @@ def validate(
     config: TrainConfig,
     loader: DataLoader,
     device: torch.device,
-) -> dict[str, float]:
+    prefix: str = "val",
+    return_queries: bool = False,
+):
+    """Mean losses plus content retrieval over a held-out pair split.
+
+    Returns the metrics, and with return_queries also the per-query retrieval
+    tensors (see src.metrics.content_retrieval) plus each query's work, for
+    bootstrapping over works.
+    """
     model.eval()
     rng_state = random.getstate()
     random.seed(config.seed)  # reproducible window sampling across epochs
     sums: dict[str, float] = defaultdict(float)
     n_batches = 0
     a_vectors, b_vectors = [], []
+    keys_a: list[str] = []
+    keys_b: list[str] = []
     for batch in loader:
         if config.data.val_max_batches and n_batches >= config.data.val_max_batches:
             break
@@ -161,25 +204,47 @@ def validate(
         )
         content, style = model.encode_mixes(content_mix, style_mix)
         total, losses = compute_losses(
-            model, config.loss, content, style, content_target, style_target, p, k
+            model,
+            config.loss,
+            content,
+            style,
+            content_target,
+            style_target,
+            p,
+            k,
+            pair_song_ids(batch, device),
         )
         sums["total"] += float(total)
         for name, value in losses.items():
             sums[name] += float(value)
         n_batches += 1
-        a_vectors.append(pool_tokens(content[:p]).cpu())
-        b_vectors.append(pool_tokens(content[p : p + p * k : k]).cpu())
+        a_vectors.append(pool_tokens(content[:p]).float().cpu())
+        b_vectors.append(pool_tokens(content[p : p + p * k : k]).float().cpu())
+        keys_a += list(batch["key_a"])
+        keys_b += list(batch["key_b"])
     random.setstate(rng_state)
     model.train()
 
-    metrics = {f"val/{name}": s / max(n_batches, 1) for name, s in sums.items()}
-    a = torch.cat(a_vectors)
-    b = torch.cat(b_vectors)
-    if len(a) >= 2:
-        # content invariance: does c_a retrieve its own cover's window?
-        similarity = a @ b.T
-        hits = similarity.argmax(dim=1) == torch.arange(len(a))
-        metrics["val/content_recall@1"] = float(hits.float().mean())
+    metrics = {f"{prefix}/{name}": s / max(n_batches, 1) for name, s in sums.items()}
+    queries: dict[str, torch.Tensor] = {}
+    if len(keys_a) >= 2:
+        # content invariance: does c_a retrieve its own cover's window, and a
+        # cover of its own composition?
+        track_index = {key: i for i, key in enumerate(sorted(set(keys_a) | set(keys_b)))}
+        works = torch.tensor([int(key.split("_")[0]) for key in keys_a])
+        queries = content_retrieval(
+            torch.cat(a_vectors),
+            torch.cat(b_vectors),
+            works,
+            torch.tensor([track_index[key] for key in keys_a]),
+            torch.tensor([track_index[key] for key in keys_b]),
+        )
+        metrics[f"{prefix}/content_recall@1"] = float(queries["pair_hit"].mean())
+        metrics[f"{prefix}/content_work_recall@1"] = float(queries["work_hit"].mean())
+        metrics[f"{prefix}/content_work_map"] = float(queries["work_ap"].mean())
+        queries["work"] = works
+    if return_queries:
+        return metrics, queries
     return metrics
 
 
@@ -207,6 +272,7 @@ def save_checkpoint(
     epoch: int,
     step: int,
     prev_weights: dict[str, torch.Tensor] | None,
+    best_metric: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -218,9 +284,39 @@ def save_checkpoint(
             "epoch": epoch,
             "step": step,
             "prev_layer_weights": prev_weights,
+            "best_metric": best_metric,
         },
         path,
     )
+
+
+def write_run_info(
+    checkpoint_dir: Path,
+    config: TrainConfig,
+    pair_loader: DataLoader,
+    track_loader: DataLoader | None,
+    total_steps: int,
+) -> None:
+    """What this run trained on, next to its checkpoints (read by learning_curve.py)."""
+    pairs = pair_loader.dataset.pairs
+    tracks = track_loader.dataset.tracks if track_loader is not None else []
+    info = {
+        "train_split": config.data.train_split,
+        "val_split": config.data.val_split,
+        "n_pairs": len(pairs),
+        "n_pair_works": len({pair.song_id for pair in pairs}),
+        "n_tracks": len(tracks),
+        "n_works": len({track.song_id for track in tracks} | {p.song_id for p in pairs}),
+        "total_steps": total_steps,
+        "batch_pairs": config.data.batch_pairs,
+        "batch_tracks": config.data.batch_tracks,
+        "layer_weights": config.layer_weights,
+        "freeze_layer_weights": config.freeze_layer_weights,
+        "seed": config.seed,
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(checkpoint_dir / "run_info.json", "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,6 +349,20 @@ def parse_args() -> argparse.Namespace:
         help="temporal pooling factor for the reconstruction target (1 = off)",
     )
     parser.add_argument("--freeze-layer-weights", action="store_true")
+    parser.add_argument(
+        "--layer-weights",
+        type=Path,
+        help="phase-1 layer-weights file to start both mixes from "
+        "(combine with --freeze-layer-weights)",
+    )
+    parser.add_argument(
+        "--val-every", type=int, help="steps between validations (0 = epoch end)"
+    )
+    parser.add_argument(
+        "--select-metric",
+        help="validation metric that picks best.pt (default val/total; "
+        "recall/map metrics are maximized, everything else minimized)",
+    )
     parser.add_argument("--resume", type=Path, help="checkpoint to resume from")
     return parser.parse_args()
 
@@ -280,6 +390,9 @@ def apply_overrides(config: TrainConfig, args: argparse.Namespace) -> None:
         (args.checkpoint_every, lambda v: setattr(direct, "checkpoint_every", v)),
         (args.mert_micro_batch, lambda v: setattr(config.mert, "micro_batch", v)),
         (args.recon_pool, lambda v: setattr(config.loss, "recon_pool", v)),
+        (args.layer_weights, lambda v: setattr(direct, "layer_weights", str(v))),
+        (args.val_every, lambda v: setattr(direct, "val_every", v)),
+        (args.select_metric, lambda v: setattr(direct, "select_metric", v)),
     ]
     for value, setter in mapping:
         if value is not None:
@@ -307,15 +420,29 @@ def main() -> None:
     val_loader = build_val_loader(config, data_root)
     steps_per_epoch = len(pair_loader)
     total_steps = config.max_steps or config.epochs * steps_per_epoch
+    # --max-steps is a budget, not just a cap: a small training subset takes
+    # more epochs to spend it, so subsets of different sizes are trained for
+    # the same number of steps under the same LR schedule.
+    n_epochs = max(config.epochs, math.ceil(total_steps / steps_per_epoch))
     print(
         f"train[{config.data.train_split}]: {len(pair_loader.dataset)} pairs, "
-        f"{steps_per_epoch} steps/epoch, {total_steps} total steps"
+        f"{steps_per_epoch} steps/epoch, {total_steps} total steps "
+        f"(up to {n_epochs} epochs)"
     )
 
     model = DisentanglementModel(config).to(device)
+    if args.resume is None and config.layer_weights:
+        load_layer_weights(model, Path(config.layer_weights), config.loss.recon_pool)
+        print(f"layer-mix weights loaded from {config.layer_weights}")
     if config.freeze_layer_weights:
         model.freeze_layer_weights()
         print("layer-mix weights frozen")
+        if args.resume is None and not config.layer_weights:
+            print(
+                "  warning: frozen at their initialization, i.e. a uniform "
+                "average of all layers; pass --layer-weights to freeze the "
+                "phase-1 mixes instead"
+            )
     mert = MertExtractor(config.mert).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -326,6 +453,7 @@ def main() -> None:
 
     start_epoch, global_step = 0, 0
     prev_weights: dict[str, torch.Tensor] | None = None
+    best: float | None = None
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -334,22 +462,68 @@ def main() -> None:
         start_epoch = checkpoint["epoch"]
         global_step = checkpoint["step"]
         prev_weights = checkpoint.get("prev_layer_weights")
+        best = checkpoint.get("best_metric")
         print(f"resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
 
     run_name = time.strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir=str(Path(config.log_dir) / run_name))
     writer.add_text("config", f"```json\n{config.to_dict()}\n```")
     checkpoint_dir = Path(config.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    write_run_info(checkpoint_dir, config, pair_loader, track_loader, total_steps)
     autocast = (
         torch.autocast("cuda", dtype=torch.bfloat16)
         if device.type == "cuda"
         else nullcontext()
     )
 
+    higher_is_better = any(tag in config.select_metric for tag in ("recall", "map"))
+    # train losses summed since the last validation, for the train/val gap
+    interval: dict[str, torch.Tensor | float] = defaultdict(float)
+    interval_steps = 0
+    last_val_step = -1
+
+    def run_validation(epoch: int) -> None:
+        """Validate, log train-vs-val, and keep best.pt on the select metric."""
+        nonlocal best, interval_steps, last_val_step
+        metrics = validate(mert, model, config, val_loader, device)
+        record = {
+            "step": global_step,
+            "epoch": epoch,
+            **metrics,
+            **{
+                f"train/{name}": float(value) / max(interval_steps, 1)
+                for name, value in interval.items()
+            },
+        }
+        interval.clear()
+        interval_steps = 0
+        last_val_step = global_step
+        print("  " + "  ".join(f"{n}={v:.4f}" for n, v in metrics.items()))
+        for name, value in metrics.items():
+            writer.add_scalar(name, value, global_step)
+        with open(checkpoint_dir / "val_metrics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        value = metrics.get(config.select_metric)
+        if value is None:
+            print(f"  warning: {config.select_metric} not among the validation metrics")
+            return
+        if best is None or (value > best if higher_is_better else value < best):
+            best = value
+            save_checkpoint(
+                checkpoint_dir / "best.pt", model, optimizer, scheduler,
+                config, epoch, global_step, prev_weights, best,
+            )
+            with open(checkpoint_dir / "best_metrics.json", "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=1)
+            print(f"  new best {config.select_metric}={value:.4f} -> best.pt")
+
     track_iter = repeat_forever(track_loader) if track_loader is not None else None
     model.train()
     done = False
-    for epoch in range(start_epoch, config.epochs):
+    epoch = start_epoch
+    for epoch in range(start_epoch, n_epochs):
         epoch_start = time.time()
         for pair_batch in pair_loader:
             track_batch = next(track_iter) if track_iter is not None else None
@@ -374,6 +548,7 @@ def main() -> None:
                     style_target,
                     p,
                     k,
+                    pair_song_ids(pair_batch, device),
                 )
 
             optimizer.zero_grad(set_to_none=True)
@@ -384,6 +559,11 @@ def main() -> None:
             optimizer.step()
             scheduler.step()
             global_step += 1
+            # detached tensors, not floats: float() would sync the GPU every step
+            interval["total"] += total.detach()
+            for name, value in losses.items():
+                interval[name] += value.detach()
+            interval_steps += 1
 
             if global_step % config.log_every == 0 or global_step == 1:
                 parts = "  ".join(
@@ -401,13 +581,17 @@ def main() -> None:
                     "train/lr", scheduler.get_last_lr()[0], global_step
                 )
 
+            if val_loader is not None and config.val_every and (
+                global_step % config.val_every == 0
+            ):
+                run_validation(epoch)
             if (
                 config.checkpoint_every
                 and global_step % config.checkpoint_every == 0
             ):
                 save_checkpoint(
                     checkpoint_dir / "last.pt", model, optimizer, scheduler,
-                    config, epoch, global_step, prev_weights,
+                    config, epoch, global_step, prev_weights, best,
                 )
             if config.max_steps and global_step >= config.max_steps:
                 done = True
@@ -418,23 +602,28 @@ def main() -> None:
         log_layer_weights(writer, weights, prev_weights, epoch)
         prev_weights = weights
 
-        if val_loader is not None:
-            metrics = validate(mert, model, config, val_loader, device)
-            parts = "  ".join(f"{n}={v:.4f}" for n, v in metrics.items())
-            print(f"  {parts}")
-            for name, value in metrics.items():
-                writer.add_scalar(name, value, global_step)
+        if val_loader is not None and not config.val_every:
+            run_validation(epoch)
 
         save_checkpoint(
             checkpoint_dir / "last.pt", model, optimizer, scheduler,
-            config, epoch + 1, global_step, prev_weights,
+            config, epoch + 1, global_step, prev_weights, best,
         )
         if done:
             break
 
+    # the final weights always get a validation point, whatever the cadence
+    if val_loader is not None and last_val_step != global_step:
+        run_validation(epoch)
+        save_checkpoint(
+            checkpoint_dir / "last.pt", model, optimizer, scheduler,
+            config, epoch + 1, global_step, prev_weights, best,
+        )
+
     writer.close()
     print(f"done at step {global_step}; checkpoint: {checkpoint_dir / 'last.pt'}")
-
+    if best is not None:
+        print(f"best {config.select_metric}={best:.4f}: {checkpoint_dir / 'best.pt'}")
 
 if __name__ == "__main__":
     main()

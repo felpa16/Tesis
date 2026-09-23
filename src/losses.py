@@ -41,7 +41,10 @@ def pool_frames(x: torch.Tensor, factor: int) -> torch.Tensor:
 
 
 def mil_nce(
-    anchors: torch.Tensor, candidates: torch.Tensor, temperature: float
+    anchors: torch.Tensor,
+    candidates: torch.Tensor,
+    temperature: float,
+    groups: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MIL-NCE over pooled content vectors.
 
@@ -49,6 +52,11 @@ def mil_nce(
     candidates: (P, K, D) — K candidate windows of cover B per pair; all K are
     treated as soft positives, every other pair's candidates as negatives.
     With K=1 this reduces to standard InfoNCE with in-batch negatives.
+    groups: optional (P,) work id per pair. Another pair from the same work is
+    the same composition, so its candidates are dropped from the denominator
+    instead of being pushed away as negatives. The fewer works a dataset has,
+    the more often this happens, so without the mask the loss would penalize
+    small subsets more.
     """
     p, k, d = candidates.shape
     if p < 2:
@@ -60,6 +68,9 @@ def mil_nce(
     rows = torch.arange(p, device=logits.device).repeat_interleave(k)
     cols = torch.arange(p * k, device=logits.device)
     positive[rows, cols] = True
+    if groups is not None:
+        same_work = groups[:, None] == groups.repeat_interleave(k)[None, :]
+        logits = logits.masked_fill(same_work & ~positive, float("-inf"))
     pos_logsumexp = logits.masked_fill(~positive, float("-inf")).logsumexp(dim=1)
     all_logsumexp = logits.logsumexp(dim=1)
     return (all_logsumexp - pos_logsumexp).mean()

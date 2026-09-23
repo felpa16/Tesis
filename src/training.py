@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -81,6 +82,50 @@ def make_scheduler(optimizer, config: TrainConfig, total_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def load_layer_weights(
+    model: DisentanglementModel, path: Path, recon_pool: int
+) -> None:
+    """Start both LayerMix vectors from a frozen phase-1 layer-weights file.
+
+    The file (phase1_layer_weights.pt) carries each branch's logits, their
+    softmax as a round-trip check, and the Standardizer statistics phase 1
+    ended with. The statistics are loaded only when they were measured at the
+    same recon_pool. Otherwise they describe a different target, and the EMA
+    starts fresh from the first batch instead.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    for branch, mix in (("content", model.content_mix), ("style", model.style_mix)):
+        logits = checkpoint[f"{branch}_logits"]
+        if logits.shape != mix.weights.shape:
+            raise SystemExit(
+                f"{path}: {branch} logits have shape {tuple(logits.shape)}, "
+                f"the model expects {tuple(mix.weights.shape)}"
+            )
+        with torch.no_grad():
+            mix.weights.copy_(logits)
+        stored = checkpoint.get(f"{branch}_softmax")
+        if stored is not None and not torch.allclose(
+            mix.softmax_weights.detach().cpu(), stored, atol=1e-5
+        ):
+            raise SystemExit(f"{path}: {branch} softmax does not reproduce from its logits")
+
+    stored_pool = checkpoint.get("config", {}).get("loss", {}).get("recon_pool")
+    if stored_pool != recon_pool:
+        print(
+            f"layer weights: standardizer stats skipped (measured at recon_pool "
+            f"{stored_pool}, this run uses {recon_pool})"
+        )
+        return
+    for branch, std in (("content", model.content_std), ("style", model.style_std)):
+        mean = checkpoint.get(f"{branch}_std_mean")
+        var = checkpoint.get(f"{branch}_std_var")
+        if mean is None or var is None:
+            continue
+        std.mean.copy_(mean)
+        std.var.copy_(var)
+        std.initialized.fill_(True)
+
+
 def extract_mixes(
     mert: MertExtractor,
     model: DisentanglementModel,
@@ -124,12 +169,16 @@ def compute_losses(
     style_target: torch.Tensor,
     n_pairs: int,
     n_candidates: int,
+    song_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """All objectives for one batch.
 
     content_target/style_target are the *pooled* mixes from pooled_targets(),
     so n_frames below is the pooled length and the decoder emits that many
     frames rather than the full 75 Hz sequence.
+
+    song_ids, (P,) work id per pair, keeps two pairs of the same work from
+    being contrasted as negatives (see mil_nce).
 
     Batch layout along dim 0 (established by the train script):
         [0, P)              A-side windows of the P aligned pairs
@@ -154,7 +203,7 @@ def compute_losses(
         anchors = pool_tokens(content[:p])
         candidates = pool_tokens(content[p : p + p * k]).view(p, k, -1)
         losses["contrastive"] = mil_nce(
-            anchors, candidates, loss_config.temperature
+            anchors, candidates, loss_config.temperature, song_ids
         )
 
     # 2b. cover-swap reconstruction: decode(c_a, s_b) vs. B's mixes (low weight)
