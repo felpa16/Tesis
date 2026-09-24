@@ -12,17 +12,23 @@ hours into preprocessing:
   * unreadable or zero-duration files
   * leftover .part files from interrupted downloads
 
+Every flagged file is written to a CSV (default data/logs/check_audio_problems.csv)
+with its split, path, problem and detail, so the list can drive a delete /
+re-download pass. The terminal only shows per-category counts.
+
 Exits non-zero if any problem is found, so it can gate an upload script.
 
 Examples:
     python scripts/check_audio.py --split val
     python scripts/check_audio.py --split all --workers 16
+    python scripts/check_audio.py --report data/logs/val_problems.csv --split val
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import json
 import shutil
 import subprocess
@@ -34,6 +40,8 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from shs100k_meta import DEFAULT_DATA_ROOT, SPLITS, audio_dir  # noqa: E402
+
+REPORT_FIELDS = ["split", "filename", "path", "problem", "detail", "duration_s", "size_bytes"]
 
 
 def require_ffprobe() -> None:
@@ -93,11 +101,14 @@ def probe(path: Path) -> dict:
     }
 
 
-def check_split(data_root: Path, split: str, workers: int, min_duration: float) -> int:
+def check_split(
+    data_root: Path, split: str, workers: int, min_duration: float
+) -> list[dict]:
+    """Probe every file of one split; return one report row per problem file."""
     directory = audio_dir(data_root, split)
     if not directory.is_dir():
         print(f"[{split}] no audio directory {directory}")
-        return 0
+        return []
 
     partials = sorted(p for p in directory.iterdir() if ".part" in p.name)
     files = sorted(
@@ -106,7 +117,7 @@ def check_split(data_root: Path, split: str, workers: int, min_duration: float) 
     )
     if not files:
         print(f"[{split}] no audio files")
-        return 0
+        return []
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(probe, files))
@@ -128,32 +139,46 @@ def check_split(data_root: Path, split: str, workers: int, min_duration: float) 
         summary = "  ".join(f"{k}={v}" for k, v in counter.most_common())
         print(f"  {label:12s} {summary}")
 
-    problems = 0
-    for label, rows, hint in (
-        ("carry a video stream", with_video, "re-download these; they waste space"),
-        ("unreadable", broken, "delete and re-download"),
-        (f"shorter than {min_duration:g}s", short, "likely truncated; delete and re-download"),
-        ("leftover .part files", [{"path": p} for p in partials], "safe to delete"),
+    report: list[dict] = []
+    for problem, label, rows, hint in (
+        ("video_stream", "carry a video stream", with_video, "re-download these; they waste space"),
+        ("unreadable", "unreadable", broken, "delete and re-download"),
+        ("too_short", f"shorter than {min_duration:g}s", short, "likely truncated; delete and re-download"),
+        ("partial", "leftover .part files", [{"path": p} for p in partials], "safe to delete"),
     ):
         if not rows:
             continue
-        problems += len(rows)
         print(f"  ! {len(rows)} {label} -- {hint}")
-        for row in rows[:5]:
-            reason = f"  ({row['error']})" if row.get("error") else ""
-            print(f"      {row['path'].name}{reason}")
-        if len(rows) > 5:
-            print(f"      ... and {len(rows) - 5} more")
+        for row in rows:
+            duration = row.get("duration")
+            report.append({
+                "split": split,
+                "filename": row["path"].name,
+                "path": str(row["path"]),
+                "problem": problem,
+                "detail": row.get("error", ""),
+                "duration_s": f"{duration:.2f}" if duration is not None else "",
+                "size_bytes": row.get("size", ""),
+            })
 
     if broken and len(broken) == len(results):
         print(
             f"\n  NOTE: every single file failed to probe. That is an "
-            f"environment problem, not corrupt data -- check the ffprobe error "
-            f"above and confirm you are pointing --data-root at the right disk."
+            f"environment problem, not corrupt data -- check the ffprobe errors "
+            f"in the report's detail column and confirm you are pointing "
+            f"--data-root at the right disk."
         )
-    if not problems:
+    if not report:
         print("  no problems found; ready to upload")
-    return problems
+    return report
+
+
+def write_report(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> None:
@@ -167,15 +192,26 @@ def main() -> None:
         default=20.0,
         help="flag files shorter than this many seconds (= the training window)",
     )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="CSV to write the problem files to "
+        "(default: <data-root>/logs/check_audio_problems.csv)",
+    )
     args = parser.parse_args()
     require_ffprobe()
+    report_path = args.report or args.data_root / "logs" / "check_audio_problems.csv"
 
     splits = list(SPLITS) if args.split == "all" else [args.split]
-    problems = sum(
-        check_split(args.data_root, s, args.workers, args.min_duration) for s in splits
-    )
+    problems = [
+        row
+        for s in splits
+        for row in check_split(args.data_root, s, args.workers, args.min_duration)
+    ]
+    write_report(report_path, problems)
     if problems:
-        print(f"\n{problems} problem file(s) found")
+        print(f"\n{len(problems)} problem file(s) found; written to {report_path}")
     raise SystemExit(1 if problems else 0)
 
 
