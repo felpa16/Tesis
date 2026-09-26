@@ -169,6 +169,7 @@ def run_chroma_stage(
         return
 
     failures = 0
+    started = time.time()
     with ProcessPoolExecutor(
         max_workers=workers, initializer=_numba_private_cache
     ) as pool:
@@ -182,7 +183,12 @@ def run_chroma_stage(
                 failures += 1
                 print(f"[chroma/{split}] {key}: {error}")
             if i % 100 == 0 or i == len(futures):
-                print(f"[chroma/{split}] {i}/{len(futures)} ({failures} failed)")
+                rate = i / max(time.time() - started, 1e-9)
+                eta = (len(futures) - i) / rate / 3600
+                print(
+                    f"[chroma/{split}] {i}/{len(futures)} ({failures} failed) "
+                    f"{rate * 3600:.0f} tracks/h, eta {eta:.1f} h"
+                )
 
 
 # --------------------------------------------------------------------------- #
@@ -678,6 +684,11 @@ def main() -> None:
         "the chroma stage is memory-hungry, keep --workers low)",
     )
     args = parser.parse_args()
+
+    # Progress lines must appear while the stage runs, not at exit. Piping to
+    # `tee` makes stdout a pipe, which Python block-buffers (~8 KB): the train
+    # chroma stage would print nothing for hours and look hung.
+    sys.stdout.reconfigure(line_buffering=True)
 
     splits = list(SPLITS) if args.split == "all" else [args.split]
     for split in splits:

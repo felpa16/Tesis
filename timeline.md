@@ -541,15 +541,109 @@ two streams: above ~0.99 centered, cache one and halve the storage.
 
 ---
 
+## 2026-09-18 — Data audit and the learning-curve pipeline
+
+### Where the data actually stands
+
+Measured from `data/logs/*_downloaded_songs.csv` and the phase-1 alignments:
+
+| | tracks | works (compositions) |
+|---|---|---|
+| train, de-contaminated, in the CSV | 96,195 | 1,639 |
+| train, downloaded | 49,809 | 931 |
+| phase-1 aligned set (= the planned phase-2 cache) | 4,010 | **105** |
+
+The downloader went work by work, so the missing train tracks all belong to
+708 works with nothing downloaded. At 76 % yield the real train ceiling is
+~81 k tracks, not 100 k. The binding axis for content (contrastive labels,
+the conditioning of p(style | content)) is the number of **works**, and
+training had seen 105 of the 931 on disk.
+
+Trainable parameters: the representation model has 127.7 M (encoders
+2 × 50.4 M, bottlenecks 2 × 4.5 M, decoder 18.0 M). The flows have 237.4 M
+(style 174.0 M, content 63.5 M), more than the encoder stack.
+
+### Decisions
+
+1. **A fixed number of usable pairs per work** (`align_covers.py
+   --kept-per-song 20`). Candidates are walked in round-robin order: each round
+   is a perfect matching, so the 20 pairs cover as many distinct recordings as
+   possible. Works align in parallel rounds until 20 pairs score ≥ 0.2, or
+   until 200 candidates are spent. The choice is written to
+   `alignments/{split}/selection_k20.json`, and `build_manifest.py
+   --kept-per-song 20` reads that file, never recomputing the order. The order
+   depends on the exact set of chroma files, so recomputing it would silently
+   disagree the moment one track differed.
+   Uncapped, the largest work (1,926 downloaded versions) would own 37 % of
+   all 4.96 M candidate pairs.
+2. **Designated eval splits `val50` / `test50`** (`splits/eval_works.json`,
+   committed). The pool is the official val ∪ test works with ≥ 10 downloaded
+   tracks, which is exactly 100 works. Those are split into size-matched halves
+   by seeded coin flips over consecutive pairs sorted by clique size. Carving
+   from train was rejected because compositions are the scarce resource, and
+   the official held-out works are already guaranteed disjoint from train. The
+   2 works listed in both official splits (5854, 186755) hold all 76 shared
+   videos and were downloaded under test only. They are sourced from one split,
+   so no video can land on both sides. Eval manifests cap tracks at 40 per work.
+   Without the cap, one work would hold 29 % of test50's tracks.
+3. **The learning curve runs online (MERT live, layer mixes frozen), not from the
+   phase-2 cache.** The cache for all 931 works would be ~0.9 TB, and the curve
+   is what decides how many works the cache needs to hold. It would also save
+   little: most of the 1.31 s step is spent in the encoders, not MERT.
+4. **Protocol.** Three nested, size-stratified work subsets (25/50/100 %,
+   `subset_manifest.py`). All three get the same step budget (≈ 10 epochs of the
+   full pair set) and the same frozen mixes, loaded by `train.py
+   --layer-weights`. Each keeps `best.pt` on val50 same-work mAP, is scored once
+   on test50, and the runs are compared by a **paired** bootstrap over test
+   works on identical windows. The runbook is
+   `docs/learning_curve_runbook.md`.
+5. **`mil_nce` now masks same-work negatives** (was an open item). This mattered
+   for the learning curve itself: the smaller the subset, the more often a batch
+   holds two pairs of one work. Unmasked, w25 would have faced ~4× the false
+   negatives of w100.
+
+### Found while testing
+
+* **The val loader iterated pairs in manifest order**, so a batch of 4 held one
+  work. After the mask, every negative dropped and `val/contrastive` read
+  exactly 0.0000. Before the mask, it measured mostly false negatives. The val
+  loader now uses a fixed seeded permutation: works mix within a batch, and the
+  order is identical at every validation and across runs with the same seed.
+* **Alignment and chroma writes are now atomic** (write `.part`, then rename),
+  and the target mode deletes and redoes unreadable `.npz` files. A spot reclaim
+  mid-write can no longer leave a truncated file that resume logic trusts.
+
+### Verification
+
+End to end on a synthetic corpus: real SHS keys, generated audio in which
+covers share a melody at different tempo and key and every fourth "cover" is
+unrelated, real chroma and alignment, and a stub MERT. The stages were target
+alignment (resume computes 0 and reproduces the selection), train / val50 /
+test50 manifests (paths from both source splits, the cap respected), nested
+subsets, `train.py` on w25 and w100 (frozen mixes, validation every N steps,
+`best.pt`, `val_metrics.jsonl`), `evaluate_encoder.py` with bootstrap intervals,
+and `learning_curve.py` with paired differences.
+
+Unit-checked:
+
+* the MIL-NCE mask against a hand computation, for K = 1 and K = 2
+* same-recording exclusion in the retrieval metric
+* the real `phase1_layer_weights.pt`, which loads into the full model (content
+  peaks at layer 9, style at 10); its standardizer stats are skipped when
+  `recon_pool` differs
+* subset exactness at the real scale (233 / 465 of 931 works)
+* `smoke_test_model.py`, which still passes
+
+---
+
 ## Open items
 
 Carried forward, not yet acted on:
 
 * `scripts/train.py` should reject an empty `--data-root` instead of resolving it
   to `.`.
-* `mil_nce` does not mask same-`song_id` negatives. Harmless for Phase 1, but it
-  caps the achievable contrastive loss and must be fixed before any real
-  representation-learning run.
+* ~~`mil_nce` does not mask same-`song_id` negatives.~~ Fixed 2026-09-18
+  (`groups` argument; `train.py` passes each pair's work id).
 * The contrastive number (0.36 vs. chance 1.386) is suggestive but weak evidence:
   4-way discrimination is easy, and `n_candidates=1` means MIL-NCE degenerates to
   plain InfoNCE. The lever for a stronger signal is `--n-candidates`, not a larger
@@ -566,3 +660,7 @@ Carried forward, not yet acted on:
   windows do feed loss 2a, so this is a diversity question, not a blocker.
 * `extract_mixes`' docstring overstates what micro-batching achieves (see bug 5
   above).
+* Validation runs in fp32 (no autocast). That is harmless, but with ~950 val50
+  pairs a pass takes ~5 min. `--val-max-batches` is the lever if it matters.
+* The learning-curve intervals cover test-set sampling, not training seeds. A
+  borderline w50 → w100 call needs a second seed of w100.

@@ -128,6 +128,7 @@ class TrainConfig:
     layer_weights: str = ""  # phase-1 layer-weights file to start the mixes from
     standardizer_momentum: float = 0.99
     val_every: int = 0  # steps between validations; 0 = at each epoch end
+    overfit_batches: int = 0  # >0: train on this many fixed batches only
     select_metric: str = "val/total"  # validation metric that picks best.pt
 
     def to_dict(self) -> dict:

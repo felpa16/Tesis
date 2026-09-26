@@ -146,19 +146,29 @@ alignments are not worth restoring, because re-aligning costs minutes.
 ```bash
 mkdir -p ~/logs
 for s in val test train; do
-  python scripts/align_covers.py --stage chroma --split $s --workers 56 \
+  python -u scripts/align_covers.py --stage chroma --split $s --workers 56 \
       --data-root $DATA 2>&1 | tee ~/logs/chroma_$s.log
 done
 ```
 
 * val and test run first. They are small, and they smoke-test the environment
   in minutes.
-* After ~15 min of train, check the rate with `tail -1 ~/logs/chroma_train.log`
-  (`[chroma/train] done/total (failed)`, printed every 100 tracks) and
-  extrapolate. If the ETA is far beyond ~5 h, lower `--workers` if the box is
-  swapping (`free -g`), or raise it if CPUs are idle (`htop`).
+* After ~15 min of train, check the rate with `tail -1 ~/logs/chroma_train.log`:
+
+  ```
+  [chroma/train] 4200/51441 (3 failed) 14500 tracks/h, eta 3.3 h
+  ```
+
+  A line lands every 100 tracks. If the ETA is far beyond ~5 h, lower
+  `--workers` if the box is swapping (`free -g`), or raise it if CPUs are idle
+  (`htop`).
+* **A progress line is not proof of progress; the output directory is.** Running
+  `ls $DATA/chroma/train | wc -l` twice a minute apart answers "is it doing
+  anything" independently of how the log is buffered.
 * **Expect** a few dozen failures in total (`too few beats`, `too short`). Those
-  tracks simply never pair.
+  tracks simply never pair. `UserWarning: Trying to estimate tuning from empty
+  frequency set` comes from librosa on near-silent audio; it is harmless, and
+  Python prints it once per worker process rather than once per track.
 
 Check: `for s in train val test; do echo "$s $(ls $DATA/chroma/$s | wc -l)"; done`.
 Each count should be within ~1 % of its audio count.
@@ -378,6 +388,17 @@ while sleep 1800; do aws s3 sync ~/Tesis/checkpoints/lc-w$W $RUN_S3/checkpoints/
 * **Red flag:** `val/recon` not clearly below the dataset-mean baseline
   (~2.04 at `recon_pool` 16, `timeline.md` run #2). The decoder would not be
   learning.
+* **Do not read the per-step lines.** At 4 pairs the contrastive term is a
+  4-way classification whose chance level is ln 4 = 1.386, so a single batch
+  swings between ~0.05 (all four anchors correct) and ~1.8 (two of four wrong)
+  regardless of progress. For a trend, run
+  `python scripts/diagnose_training.py checkpoints/lc-w$W/train.log --batch-pairs 4`,
+  which blocks the samples and bootstraps the first-vs-last difference.
+* **If nothing is moving,** `--overfit-batches 2` retrains on two fixed batches
+  with validation off. Every term should collapse toward 0 within a few hundred
+  steps; a term that does not is one the model cannot fit even after
+  memorizing the data, which points at capacity or optimization rather than at
+  the data.
 * Validation takes ~5 min per pass (~950 pairs). If that is too slow, add
   `--val-max-batches 120`. The val order is a fixed permutation, so a capped
   pass is still the same subset every time.
@@ -493,4 +514,5 @@ is the flow-overfitting signal.
 | `excluded N tracks of designated eval works` when building train | an eval work's audio sits under train (a future designation drawn from train) | expected and correct: eval works never reach training |
 | `FileNotFoundError: manifests/...` on a GPU box | `$DATA` unset in that shell | `source ~/.bashrc`; `tmux kill-server` if tmux started before the export |
 | `OutOfMemoryError` | batch too large for the A10G | keep 4+4 and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (phase 1 peaked at 18.7 of 22 GB with *trainable* mixes; frozen mixes no longer keep MERT's hidden states for backward, so there is more headroom) |
+| chroma prints its header, then nothing for a long time | stdout is block-buffered (~8 KB) behind `tee`, so the every-100-tracks lines pile up invisibly. `align_covers.py` now line-buffers stdout; `python -u` fixes older code | it is almost certainly running: `ls $DATA/chroma/$s \| wc -l` |
 | GPU idle, CPU pegged | ffmpeg decoding can't keep up | `--num-workers 6`. If still starved, use g5.4xlarge (16 vCPU) for all three runs, since the runs must match |

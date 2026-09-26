@@ -91,29 +91,38 @@ def build_train_loaders(
     split = config.data.train_split
     tracks = read_tracks(data_root, split)
     pairs = read_pairs(data_root, split)
+    # Capacity/optimization probe: keep only as much data as --overfit-batches
+    # asks for, and stop shuffling, so every epoch replays the same batches.
+    # `tracks` stays whole here: AlignedPairDataset uses it as a lookup table
+    # and silently drops any pair whose two recordings are missing from it.
+    overfit_tracks = tracks
+    if config.overfit_batches:
+        pairs = pairs[: config.overfit_batches * config.data.batch_pairs]
+        overfit_tracks = tracks[: config.overfit_batches * config.data.batch_tracks]
     pair_dataset = AlignedPairDataset(
         pairs, tracks, data_root, make_window_config(config, config.data.n_candidates)
     )
     if len(pair_dataset) == 0:
         raise SystemExit(f"no usable aligned pairs in split {split!r}")
+    overfit = bool(config.overfit_batches)
     pair_loader = DataLoader(
         pair_dataset,
         batch_size=config.data.batch_pairs,
-        shuffle=True,
-        num_workers=config.data.num_workers,
+        shuffle=not overfit,
+        num_workers=0 if overfit else config.data.num_workers,
         worker_init_fn=worker_init,
         drop_last=len(pair_dataset) > config.data.batch_pairs,
     )
     track_loader = None
     if config.data.batch_tracks > 0:
         track_dataset = TrackWindowDataset(
-            tracks, data_root, make_window_config(config, 1)
+            overfit_tracks, data_root, make_window_config(config, 1)
         )
         track_loader = DataLoader(
             track_dataset,
             batch_size=config.data.batch_tracks,
-            shuffle=True,
-            num_workers=config.data.num_workers,
+            shuffle=not overfit,
+            num_workers=0 if overfit else config.data.num_workers,
             worker_init_fn=worker_init,
             drop_last=False,
         )
@@ -359,6 +368,13 @@ def parse_args() -> argparse.Namespace:
         "--val-every", type=int, help="steps between validations (0 = epoch end)"
     )
     parser.add_argument(
+        "--overfit-batches",
+        type=int,
+        help="train on this many fixed batches, replayed every epoch, with "
+        "validation off. If the losses do not collapse toward zero, the "
+        "problem is capacity or optimization, not the data",
+    )
+    parser.add_argument(
         "--select-metric",
         help="validation metric that picks best.pt (default val/total; "
         "recall/map metrics are maximized, everything else minimized)",
@@ -392,6 +408,7 @@ def apply_overrides(config: TrainConfig, args: argparse.Namespace) -> None:
         (args.recon_pool, lambda v: setattr(config.loss, "recon_pool", v)),
         (args.layer_weights, lambda v: setattr(direct, "layer_weights", str(v))),
         (args.val_every, lambda v: setattr(direct, "val_every", v)),
+        (args.overfit_batches, lambda v: setattr(direct, "overfit_batches", v)),
         (args.select_metric, lambda v: setattr(direct, "select_metric", v)),
     ]
     for value, setter in mapping:
@@ -417,7 +434,13 @@ def main() -> None:
     print(f"device={device.type}  data_root={data_root}")
 
     pair_loader, track_loader = build_train_loaders(config, data_root)
-    val_loader = build_val_loader(config, data_root)
+    if config.overfit_batches:
+        print(
+            f"overfit probe: {config.overfit_batches} fixed batches, no shuffling, "
+            "no validation. Every loss term should approach 0; whatever does not "
+            "is a term the model cannot fit even with the data memorized."
+        )
+    val_loader = None if config.overfit_batches else build_val_loader(config, data_root)
     steps_per_epoch = len(pair_loader)
     total_steps = config.max_steps or config.epochs * steps_per_epoch
     # --max-steps is a budget, not just a cap: a small training subset takes
@@ -525,6 +548,11 @@ def main() -> None:
     epoch = start_epoch
     for epoch in range(start_epoch, n_epochs):
         epoch_start = time.time()
+        if config.overfit_batches:
+            # windows.py draws a fresh random anchor on every __getitem__, so
+            # without this the "fixed" batches would hold new audio each epoch
+            # and memorizing them would be impossible by construction.
+            random.seed(config.seed)
         for pair_batch in pair_loader:
             track_batch = next(track_iter) if track_iter is not None else None
             waves, p, k = assemble_waves(pair_batch, track_batch, device)
