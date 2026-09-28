@@ -147,8 +147,9 @@ def main() -> None:
 
     var = model.content_std.var
     print(f"\nstandardiser (content): var min={var.min():.3e}  median={var.median():.3e}  max={var.max():.3e}")
-    print("  -> a min many orders below the median means near-constant MERT dims")
-    print("     get amplified into pure noise by standardisation.")
+    if var.min() < var.median() / 1e3:
+        print("  WARNING: the min is orders below the median, so near-constant MERT")
+        print("  dims are being amplified into pure noise by standardisation.")
 
     if args.weights_only:
         return
@@ -181,18 +182,35 @@ def main() -> None:
         mert, model, loader, device, args.batches, config.mert, config.loss, autocast
     )
     ceiling, floor, actual = scores["global_mean"], scores["window_mean"], scores["recon"]
+    loss_pool = config.loss.recon_pool
     print(f"\n  predict dataset mean      {ceiling:.4f}   <- learning nothing")
     print(f"  MODEL recon               {actual:.4f}")
     print(f"  predict per-window mean   {floor:.4f}   <- a single 1024-d vector per window")
     span = ceiling - floor
+    explained = (ceiling - actual) / ceiling if ceiling > 1e-6 else 0.0
     if span > 1e-6:
-        print(f"\n  variance explained vs. dataset mean : {100 * (ceiling - actual) / ceiling:5.1f}%")
+        print(f"\n  variance explained vs. dataset mean : {100 * explained:5.1f}%")
         print(f"  fraction of the between-window range: {100 * (ceiling - actual) / span:5.1f}%")
         print("\n  100%+ of the range means the latents beat a per-window constant.")
         print("  ~0% means the decoder has not moved off the dataset mean.")
-    print(f"\n  decoder output std        {scores['pred_std'] / 2:.4f}   (target std = 1.0)")
-    print("  -> near 0 with cycle ~0 is the steganography failure mode: a tiny")
-    print("     perturbation on the mean, carrying latents the encoder reads back.")
+        # How much of this target a window-level summary can explain at all. If
+        # it is small, most of the pooled target is still temporal detail inside
+        # the window and recon_pool is too low for a 16-token latent set: rerun
+        # with --recon-pool 32/64/96 to see the share grow.
+        print(f"\n  a per-window constant explains {100 * span / ceiling:5.1f}% of this "
+              f"target\n  (recon_pool={loss_pool}; the rest is temporal detail inside "
+              "the window)")
+    std = scores["pred_std"] / 2
+    print(f"\n  decoder output std        {std:.4f}   (target std = 1.0)")
+    if std < 0.1:
+        print("  WARNING: near 0. With cycle ~0 this is the steganography failure")
+        print("  mode: a tiny perturbation on the mean, carrying latents the")
+        print("  encoder reads back.")
+    elif abs(std**2 - explained) < 0.25 * max(explained, 1e-6):
+        print(f"  -> std^2 = {std**2:.3f} matches the {explained:.3f} variance "
+              "explained, which is\n     MSE-optimal shrinkage under a mostly "
+              "unpredictable target, not\n     steganography and not underfitting "
+              "capacity.")
 
 
 if __name__ == "__main__":

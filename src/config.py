@@ -57,6 +57,8 @@ class LossConfig:
     cycle_weight: float = 0.25  # 2c latent cycle-consistency
     decorrelation_weight: float = 0.1
     temperature: float = 0.1  # contrastive temperature
+    negative_queue: int = 1000  # extra contrastive negatives kept from
+    # earlier steps (0 = off). 3 in-batch negatives saturate the loss.
     cosine_weight: float = 0.0  # optional cosine term in reconstruction
     recon_pool: int = 16  # temporal pooling of the reconstruction target; 1 = off
     cycle_fraction: float = 0.5  # fraction of the batch used for 2c
@@ -85,6 +87,27 @@ class FlowConfig:
 
 
 @dataclass
+class AugmentConfig:
+    """Style-only augmentation of the contrastive view (src/data/augment.py).
+
+    Off by default: it changes what the contrastive loss is invariant to, so it
+    is an ablation, not a default. Pitch and tempo are deliberately absent —
+    real covers supply those.
+    """
+
+    enabled: bool = False
+    probability: float = 0.5  # per transform, so the identity stays reachable
+    gain_db: float = 6.0
+    tilt_db: float = 6.0  # broadband spectral slope
+    peak_db: float = 8.0  # one random resonant peak/notch
+    lowpass_hz: tuple[float, float] = (6000.0, 12000.0)  # codec-like rolloff
+    noise_snr_db: tuple[float, float] = (20.0, 40.0)
+    saturation: float = 3.0  # tanh drive; 1.0 = off
+    reverb_seconds: float = 0.25
+    wet: float = 0.25  # reverb level relative to the dry signal
+
+
+@dataclass
 class DataConfig:
     data_root: str = ""  # empty -> shs100k_meta.DEFAULT_DATA_ROOT
     train_split: str = "train"
@@ -95,6 +118,7 @@ class DataConfig:
     n_candidates: int = 1  # B-windows per pair (MIL-NCE when > 1)
     num_workers: int = 2
     val_max_batches: int = 0  # cap validation batches; 0 = full pass
+    augment: AugmentConfig = field(default_factory=AugmentConfig)
 
 
 @dataclass

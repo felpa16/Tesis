@@ -170,6 +170,8 @@ def compute_losses(
     n_pairs: int,
     n_candidates: int,
     song_ids: torch.Tensor | None = None,
+    queue: tuple[torch.Tensor, torch.Tensor] | None = None,
+    recon_index: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """All objectives for one batch.
 
@@ -179,6 +181,13 @@ def compute_losses(
 
     song_ids, (P,) work id per pair, keeps two pairs of the same work from
     being contrasted as negatives (see mil_nce).
+
+    queue holds extra contrastive negatives from earlier steps (ContentQueue).
+
+    recon_index selects which windows the plain reconstruction term 2a is scored
+    on; None means every window. It exists so augmented windows can feed the
+    contrastive loss without becoming reconstruction targets — the decoder and
+    the style branch must only ever be fitted to real recordings.
 
     Batch layout along dim 0 (established by the train script):
         [0, P)              A-side windows of the P aligned pairs
@@ -190,12 +199,19 @@ def compute_losses(
     device = content.device
     losses: dict[str, torch.Tensor] = {}
 
-    # 2a. plain reconstruction on every window (main weight)
-    pred_content, pred_style = model.decode(content, style, n_frames)
+    # 2a. plain reconstruction (main weight), on real windows only
+    if recon_index is None:
+        recon_content, recon_style = content, style
+        target_content, target_style = content_target, style_target
+    else:
+        recon_content, recon_style = content[recon_index], style[recon_index]
+        target_content = content_target[recon_index]
+        target_style = style_target[recon_index]
+    pred_content, pred_style = model.decode(recon_content, recon_style, n_frames)
     losses["recon"] = standardized_mse(
-        pred_content, content_target, model.content_std, loss_config.cosine_weight
+        pred_content, target_content, model.content_std, loss_config.cosine_weight
     ) + standardized_mse(
-        pred_style, style_target, model.style_std, loss_config.cosine_weight
+        pred_style, target_style, model.style_std, loss_config.cosine_weight
     )
 
     # 1. contrastive on content tokens (MIL-NCE over the K candidates)
@@ -203,7 +219,7 @@ def compute_losses(
         anchors = pool_tokens(content[:p])
         candidates = pool_tokens(content[p : p + p * k]).view(p, k, -1)
         losses["contrastive"] = mil_nce(
-            anchors, candidates, loss_config.temperature, song_ids
+            anchors, candidates, loss_config.temperature, song_ids, queue
         )
 
     # 2b. cover-swap reconstruction: decode(c_a, s_b) vs. B's mixes (low weight)

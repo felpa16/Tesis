@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.data.augment import augment_waveform
 from src.data.manifest import PairEntry, TrackEntry
 
 
@@ -31,6 +32,10 @@ class WindowConfig:
     # max jitter (seconds) of each extra candidate around the aligned point.
     n_candidates: int = 1
     candidate_spread_seconds: float = 4.0
+    # Style-only augmentation of the pair's A-side window (AugmentConfig).
+    # None = off. Only the A side is touched, so the B side stays a clean
+    # reconstruction target; see src/data/augment.py.
+    augment: object | None = None
 
     @property
     def window_samples(self) -> int:
@@ -145,6 +150,20 @@ class AlignedPairDataset(Dataset):
 
         start_a = _clamped_start(anchor_a, dur_a, config.window_seconds)
         wave_a = decode_window(path_a, start_a, config)
+        if config.augment is not None and config.augment.enabled:
+            # A dedicated RNG, not the global one: augmentation must not shift
+            # the window-sampling stream, or an augment-on run and an
+            # augment-off run would see different windows and the ablation
+            # would confound the two. torch.initial_seed() is set per worker
+            # per epoch by the DataLoader, so this varies across epochs when
+            # num_workers > 0 and is fixed per item when it is 0 (which is what
+            # --overfit-batches wants).
+            wave_a = augment_waveform(
+                wave_a,
+                config.sample_rate,
+                config.augment,
+                random.Random(torch.initial_seed() + index),
+            )
 
         centers_b = [anchor_b] + [
             anchor_b + random.uniform(-1.0, 1.0) * config.candidate_spread_seconds

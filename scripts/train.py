@@ -62,7 +62,7 @@ from src.data import (  # noqa: E402
     read_pairs,
     read_tracks,
 )
-from src.losses import pool_tokens  # noqa: E402
+from src.losses import ContentQueue, pool_tokens  # noqa: E402
 from src.metrics import content_retrieval  # noqa: E402
 from src.models import DisentanglementModel, MertExtractor  # noqa: E402
 from src.training import (  # noqa: E402
@@ -77,11 +77,16 @@ from src.training import (  # noqa: E402
 )
 
 
-def make_window_config(config: TrainConfig, n_candidates: int) -> WindowConfig:
+def make_window_config(
+    config: TrainConfig, n_candidates: int, augment: bool = False
+) -> WindowConfig:
+    """augment=True only for the *training* pair stream: validation must stay
+    comparable across runs, and the track stream is pure reconstruction data."""
     return WindowConfig(
         window_seconds=config.data.window_seconds,
         sample_rate=config.mert.sample_rate,
         n_candidates=n_candidates,
+        augment=config.data.augment if augment else None,
     )
 
 
@@ -100,7 +105,10 @@ def build_train_loaders(
         pairs = pairs[: config.overfit_batches * config.data.batch_pairs]
         overfit_tracks = tracks[: config.overfit_batches * config.data.batch_tracks]
     pair_dataset = AlignedPairDataset(
-        pairs, tracks, data_root, make_window_config(config, config.data.n_candidates)
+        pairs,
+        tracks,
+        data_root,
+        make_window_config(config, config.data.n_candidates, augment=True),
     )
     if len(pair_dataset) == 0:
         raise SystemExit(f"no usable aligned pairs in split {split!r}")
@@ -319,6 +327,9 @@ def write_run_info(
         "total_steps": total_steps,
         "batch_pairs": config.data.batch_pairs,
         "batch_tracks": config.data.batch_tracks,
+        "n_candidates": config.data.n_candidates,
+        "negative_queue": config.loss.negative_queue,
+        "augment": config.data.augment.enabled,
         "layer_weights": config.layer_weights,
         "freeze_layer_weights": config.freeze_layer_weights,
         "seed": config.seed,
@@ -368,6 +379,22 @@ def parse_args() -> argparse.Namespace:
         "--val-every", type=int, help="steps between validations (0 = epoch end)"
     )
     parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="style-only augmentation (EQ, bandwidth, reverb, saturation, "
+        "noise, gain) of each pair's A-side window. Synthesises extra "
+        "performances of a known work, which is what attacks work "
+        "memorisation. Augmented windows are excluded from the reconstruction "
+        "terms; pitch and tempo are not augmented",
+    )
+    parser.add_argument(
+        "--negative-queue",
+        type=int,
+        help="extra contrastive negatives kept from earlier steps (default "
+        "1000, 0 = off). Enlarges the denominator without enlarging the batch, "
+        "which is capped by MERT activation memory",
+    )
+    parser.add_argument(
         "--overfit-batches",
         type=int,
         help="train on this many fixed batches, replayed every epoch, with "
@@ -409,6 +436,8 @@ def apply_overrides(config: TrainConfig, args: argparse.Namespace) -> None:
         (args.layer_weights, lambda v: setattr(direct, "layer_weights", str(v))),
         (args.val_every, lambda v: setattr(direct, "val_every", v)),
         (args.overfit_batches, lambda v: setattr(direct, "overfit_batches", v)),
+        (args.negative_queue, lambda v: setattr(config.loss, "negative_queue", v)),
+        (args.augment or None, lambda v: setattr(config.data.augment, "enabled", v)),
         (args.select_metric, lambda v: setattr(direct, "select_metric", v)),
     ]
     for value, setter in mapping:
@@ -542,6 +571,16 @@ def main() -> None:
                 json.dump(record, f, indent=1)
             print(f"  new best {config.select_metric}={value:.4f} -> best.pt")
 
+    queue = None
+    if config.loss.negative_queue > 0 and config.loss.contrastive_weight > 0:
+        queue = ContentQueue(
+            config.loss.negative_queue, config.bottleneck.token_dim
+        ).to(device)
+        print(
+            f"contrastive negatives: {config.data.batch_pairs * config.data.n_candidates - 1}"
+            f" in-batch + up to {config.loss.negative_queue} queued"
+        )
+
     track_iter = repeat_forever(track_loader) if track_loader is not None else None
     model.train()
     done = False
@@ -556,6 +595,7 @@ def main() -> None:
         for pair_batch in pair_loader:
             track_batch = next(track_iter) if track_iter is not None else None
             waves, p, k = assemble_waves(pair_batch, track_batch, device)
+            song_ids = pair_song_ids(pair_batch, device)
 
             with autocast:
                 content_mix, style_mix = extract_mixes(
@@ -564,8 +604,19 @@ def main() -> None:
                 content_target, style_target = pooled_targets(
                     config.loss, content_mix, style_mix
                 )
-                model.content_std.update(content_target)
-                model.style_std.update(style_target)
+                # An augmented A window is a contrastive view, never a
+                # reconstruction target: fitting the decoder and the style
+                # branch to it would teach P(style | content) that lowpassed,
+                # saturated audio is ordinary human style.
+                recon_index = None
+                if config.data.augment.enabled and p > 0:
+                    recon_index = torch.arange(p, waves.shape[0], device=device)
+                model.content_std.update(
+                    content_target if recon_index is None else content_target[recon_index]
+                )
+                model.style_std.update(
+                    style_target if recon_index is None else style_target[recon_index]
+                )
                 content, style = model.encode_mixes(content_mix, style_mix)
                 total, losses = compute_losses(
                     model,
@@ -576,7 +627,16 @@ def main() -> None:
                     style_target,
                     p,
                     k,
-                    pair_song_ids(pair_batch, device),
+                    song_ids,
+                    queue.negatives() if queue is not None else None,
+                    recon_index,
+                )
+            if queue is not None and p > 0:
+                # the B-side candidates are what populates the denominator, so
+                # they are what gets queued, tagged with their work
+                queue.push(
+                    pool_tokens(content[p : p + p * k]),
+                    song_ids.repeat_interleave(k),
                 )
 
             optimizer.zero_grad(set_to_none=True)

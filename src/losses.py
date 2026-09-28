@@ -1,6 +1,7 @@
 """Training objectives for the representation-learning stage (see CLAUDE.md).
 
 1. mil_nce            — contrastive loss on content tokens (K=1 -> InfoNCE)
+   ContentQueue       — FIFO of recent content vectors, extra negatives for it
 2. pool_frames        — temporal pooling of the reconstruction target
    standardized_mse   — reconstruction terms 2a/2b on standardized mixes
    cycle_loss         — term 2c, decode-swap-re-encode with detached targets
@@ -10,6 +11,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.model import DisentanglementModel, Standardizer
@@ -45,6 +47,7 @@ def mil_nce(
     candidates: torch.Tensor,
     temperature: float,
     groups: torch.Tensor | None = None,
+    queue: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """MIL-NCE over pooled content vectors.
 
@@ -57,23 +60,98 @@ def mil_nce(
     instead of being pushed away as negatives. The fewer works a dataset has,
     the more often this happens, so without the mask the loss would penalize
     small subsets more.
+    queue: optional (vectors (Q, D), works (Q,)) of extra negatives from earlier
+    steps, see ContentQueue. At P=4, K=1 an anchor otherwise has 3 negatives and
+    the loss saturates (timeline.md, 2026-09-27); the queue makes the
+    denominator large without making the batch large. Queue entries of the
+    anchor's own work are masked out exactly like in-batch ones.
     """
     p, k, d = candidates.shape
-    if p < 2:
+    if p < 1 or (p < 2 and queue is None):
         return anchors.new_zeros(())
     anchors = F.normalize(anchors, dim=-1)
     flat = F.normalize(candidates.reshape(p * k, d), dim=-1)
-    logits = anchors @ flat.T / temperature  # (P, P*K)
-    positive = torch.zeros(p, p * k, dtype=torch.bool, device=logits.device)
+    candidate_groups = None if groups is None else groups.repeat_interleave(k)
+    if queue is not None:
+        queue_vectors, queue_groups = queue
+        flat = torch.cat([flat, F.normalize(queue_vectors.to(flat.dtype), dim=-1)])
+        if candidate_groups is not None:
+            candidate_groups = torch.cat(
+                [candidate_groups, queue_groups.to(candidate_groups)]
+            )
+    logits = anchors @ flat.T / temperature  # (P, P*K + Q)
+    positive = torch.zeros(
+        p, flat.shape[0], dtype=torch.bool, device=logits.device
+    )
     rows = torch.arange(p, device=logits.device).repeat_interleave(k)
     cols = torch.arange(p * k, device=logits.device)
     positive[rows, cols] = True
-    if groups is not None:
-        same_work = groups[:, None] == groups.repeat_interleave(k)[None, :]
+    if candidate_groups is not None:
+        same_work = groups[:, None] == candidate_groups[None, :]
         logits = logits.masked_fill(same_work & ~positive, float("-inf"))
     pos_logsumexp = logits.masked_fill(~positive, float("-inf")).logsumexp(dim=1)
     all_logsumexp = logits.logsumexp(dim=1)
     return (all_logsumexp - pos_logsumexp).mean()
+
+
+class ContentQueue(nn.Module):
+    """FIFO of recent pooled content vectors, used as extra contrastive negatives.
+
+    Why: at --batch-pairs 4 --n-candidates 1 each anchor sees 3 negatives, so
+    the task is a 4-way choice that saturates once works separate coarsely — the
+    measured plateau in timeline.md (2026-09-27). A queue enlarges the
+    denominator without enlarging the batch, which matters because the batch is
+    capped by MERT's activation memory, not by the contrastive term.
+
+    What it does NOT fix: a model that has memorized which work each training
+    recording belongs to ranks same-work candidates first however many negatives
+    there are. The queue attacks saturation; only more works (or augmentation)
+    attacks memorization.
+
+    Entries are detached and stored L2-normalized, and they are not re-encoded
+    as the encoder trains, so old entries go stale. Keep `size` small enough
+    that the encoder's drift over size/(P*K) steps stays modest; the alternative
+    is a momentum encoder (MoCo), which costs a second copy of the weights.
+
+    The buffers are non-persistent, so the queue never enters a checkpoint: an
+    older checkpoint still loads, and a resumed run refills over its first
+    size/(P*K) steps.
+    """
+
+    def __init__(self, size: int, dim: int) -> None:
+        super().__init__()
+        self.size = int(size)
+        self.register_buffer("vectors", torch.zeros(self.size, dim), persistent=False)
+        self.register_buffer(
+            "works", torch.full((self.size,), -1, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "cursor", torch.zeros((), dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "filled", torch.zeros((), dtype=torch.long), persistent=False
+        )
+
+    def negatives(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The valid entries, or None until something has been pushed."""
+        n = int(self.filled)
+        if n == 0:
+            return None
+        return self.vectors[:n], self.works[:n]
+
+    @torch.no_grad()
+    def push(self, vectors: torch.Tensor, works: torch.Tensor) -> None:
+        """Add this batch's candidate vectors, overwriting the oldest entries."""
+        vectors = F.normalize(vectors.detach().float(), dim=-1)
+        works = works.detach().reshape(-1).to(torch.long)
+        if vectors.shape[0] > self.size:  # a batch larger than the queue
+            vectors, works = vectors[-self.size :], works[-self.size :]
+        n = vectors.shape[0]
+        index = (torch.arange(n, device=vectors.device) + int(self.cursor)) % self.size
+        self.vectors[index] = vectors.to(self.vectors.dtype)
+        self.works[index] = works.to(self.works.device)
+        self.cursor.fill_((int(self.cursor) + n) % self.size)
+        self.filled.fill_(min(int(self.filled) + n, self.size))
 
 
 def standardized_mse(
