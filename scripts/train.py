@@ -344,7 +344,12 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--config", type=Path, help="JSON config overriding defaults")
-    parser.add_argument("--data-root", type=Path)
+    parser.add_argument(
+        "--data-root",
+        help="directory holding audio/, alignments/ and manifests/. Taken as a "
+        "string, not a Path, so that an empty $DATA is detectable: Path('') "
+        "collapses to '.' and would silently resolve to the current directory",
+    )
     parser.add_argument("--train-split")
     parser.add_argument("--val-split")
     parser.add_argument("--window-seconds", type=float)
@@ -457,10 +462,40 @@ def main() -> None:
     torch.manual_seed(config.seed)
 
     device = pick_device(config.device)
+    if args.data_root is not None and not args.data_root.strip():
+        raise SystemExit(
+            "--data-root is empty. $DATA is probably unset in this shell: export it "
+            "and, if tmux started before the export, run `tmux kill-server`."
+        )
+    defaulted = not config.data.data_root
     data_root = (
-        Path(config.data.data_root) if config.data.data_root else DEFAULT_DATA_ROOT
+        DEFAULT_DATA_ROOT if defaulted else Path(config.data.data_root)
     )
     print(f"device={device.type}  data_root={data_root}")
+
+    # Fail here, with the resolved root in the message, rather than inside
+    # read_tracks with a bare FileNotFoundError. The usual cause is a shell that
+    # never had $DATA, in which case --data-root was not passed at all and this
+    # silently fell back to the repo's own data/ directory.
+    manifest_dir = data_root / "manifests" / config.data.train_split
+    if not (manifest_dir / "tracks.jsonl").exists():
+        available = sorted(
+            d.name
+            for d in (data_root / "manifests").glob("*")
+            if (d / "tracks.jsonl").exists()
+        )
+        raise SystemExit(
+            f"no manifest at {manifest_dir}/tracks.jsonl\n"
+            + (
+                "  --data-root was not passed, so this is the built-in default; "
+                "$DATA was probably unset or your $COMMON/launch shell state is "
+                "gone (a new tmux pane does not inherit it).\n"
+                if defaulted
+                else ""
+            )
+            + f"  splits present under {data_root}/manifests: "
+            + (", ".join(available) if available else "none")
+        )
 
     pair_loader, track_loader = build_train_loaders(config, data_root)
     if config.overfit_batches:
@@ -654,16 +689,19 @@ def main() -> None:
             interval_steps += 1
 
             if global_step % config.log_every == 0 or global_step == 1:
-                parts = "  ".join(
-                    f"{name}={float(value):.4f}" for name, value in losses.items()
-                )
+                # .detach() before float(): these tensors are still attached to
+                # the (already-consumed) graph and float() on them warns. Read
+                # each one once — every float() of a CUDA tensor is a GPU sync.
+                step_total = float(total.detach())
+                scalars = {n: float(v.detach()) for n, v in losses.items()}
+                parts = "  ".join(f"{n}={v:.4f}" for n, v in scalars.items())
                 print(
                     f"epoch {epoch} step {global_step}/{total_steps}  "
-                    f"total={float(total):.4f}  {parts}"
+                    f"total={step_total:.4f}  {parts}"
                 )
-                writer.add_scalar("train/total", float(total), global_step)
-                for name, value in losses.items():
-                    writer.add_scalar(f"train/{name}", float(value), global_step)
+                writer.add_scalar("train/total", step_total, global_step)
+                for name, value in scalars.items():
+                    writer.add_scalar(f"train/{name}", value, global_step)
                 writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
                 writer.add_scalar(
                     "train/lr", scheduler.get_last_lr()[0], global_step

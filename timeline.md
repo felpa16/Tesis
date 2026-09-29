@@ -636,18 +636,384 @@ Unit-checked:
 
 ---
 
+## 2026-09-27 — Learning-curve run 1 of 3 (`lc-w25`): the content encoder learns, then memorises
+
+First run of the 2026-09-18 protocol. It answers more than it was designed to,
+because it overfits visibly and the trajectory says where and why.
+
+**Configuration.** Measured from `run_info.json` (`q-w25`, which uses the same
+`train_w25` manifest) and the run header, 2026-09-29.
+
+| | |
+|---|---|
+| instance | g5.2xlarge (A10G) |
+| kept pairs per work | **40**, not the 20 the runbook specifies |
+| `train_w25` | **241 works** (239 of them contributing pairs), **8,744 pairs**, 13,273 tracks |
+| steps/epoch | 2,186 → 40 epochs for the 87,372-step budget |
+| `train_w100` (sets the budget) | 34,949 pairs → 87,372 steps |
+| epochs | **40** — the budget is fixed in steps, so w25 makes 4× the passes w100 will |
+| batch | `--batch-pairs 4 --batch-tracks 4`, `n_candidates = 1` |
+| `val50` | **1,703 pairs** (recovered from the retrieval denominators: every value is k/1703) |
+| layer mixes | loaded from `phase1_layer_weights.pt` and frozen |
+| selection | `best.pt` on `val/content_work_map` |
+
+### Held-out content retrieval, measured for the first time
+
+| step | val work mAP | val work R@1 | val pair R@1 |
+|---|---|---|---|
+| 2,500 | 0.112 | 0.142 | 0.008 |
+| 12,500 | 0.155 | 0.219 | 0.006 |
+| 22,500 | 0.174 | 0.235 | 0.008 |
+| 50,000 | 0.184 | 0.232 | 0.012 |
+| **67,500** | **0.188** ← peak, `best.pt` | 0.262 | 0.013 |
+| 87,372 | 0.185 | 0.255 | 0.010 |
+
+Chance on a 1,703-query pool is 1/1703 = 0.059 % for pair R@1 and ≈ 2 % for the
+work metrics (≈ 34 same-work candidates per query if val50's 1,703 pairs spread
+evenly over its 50 works). So work mAP is ~9× chance and pair R@1 ~17–25×
+chance: **real content invariance across unseen compositions, and modest.**
+
+**The last 23 % of the budget bought nothing.** The metric is flat from ~step
+60,000 (0.184–0.188, oscillating) to the end.
+
+### It overfits, and it starts at epoch 7
+
+| step | train/contrastive | val/contrastive | gap |
+|---|---|---|---|
+| 2,500 | 1.087 | 0.930 | −0.157 |
+| 15,000 | 0.724 | **0.758** ← val minimum | +0.034 |
+| 50,000 | 0.522 | 0.921 | +0.399 |
+| 87,372 | 0.329 | 0.947 | +0.618 |
+
+Train falls monotonically; val bottoms at step 15,000 (epoch ~7, i.e. seven
+passes over the pair set) and climbs steadily after.
+
+**Only the contrastive term overfits.** `val/recon` falls monotonically all run
+(1.926 → 1.818) and `val/swap` with it. That is the 2026-09-18 prediction
+confirmed: reconstruction is per-recording, and w25 still holds thousands of
+recordings, so works are not its scarce resource. `val/cycle` falls
+0.071 → 0.012 and `val/decorrelation` 0.125 → 0.103.
+
+### Why it overfits
+
+The contrastive task as configured is *solvable by memorising work identity*,
+and four things make that the path of least resistance:
+
+1. **241 works.** "Pick the cover among 4" needs only a work-identity embedding
+   for each of the 13,273 recordings (8,744 pairs over 239 of those works).
+   That generalises to zero unseen works, which is exactly what the held-out
+   plateau shows.
+2. **40 passes over the pair set.** Anchors are resampled per visit, so the
+   *windows* differ, but the recording pair repeats 40 times — which is what
+   memorisation needs. Overfitting begins at pass 7.
+3. **Three negatives.** `n_candidates = 1` at `batch_pairs 4` makes each step a
+   4-way choice. Once works are coarsely separated the loss saturates (many
+   steps at ~0.05, against chance ln 4 = 1.386), gradients collapse, and the
+   remaining 70,000 steps sharpen work-specific features instead of general
+   ones. This is the mechanism that converts a saturated task into memorisation,
+   and it is the already-open `--n-candidates` item below.
+4. **No regularisation on the content path.** `EncoderConfig.dropout = 0.0`,
+   `weight_decay = 0.01`, 50.4 M parameters per encoder.
+
+Note the loss and the metric disagree about *when* things go wrong:
+`val/contrastive` degrades from step 15,000 while `val/content_work_map` keeps
+improving to 67,500. At temperature 0.1 the loss punishes *confident* errors, so
+it tracks calibration; mAP tracks ranking. **Selecting on
+`val/content_work_map` was load-bearing** — `val/total` would have picked
+~step 32,500 and thrown away real gains.
+
+### The reconstruction ceiling, quantified
+
+`inspect_phase1.py` on `last.pt`, against `val50`:
+
+```
+predict dataset mean      2.0230
+MODEL recon               1.8565
+predict per-window mean   1.7897     <- the model is still worse than this
+```
+
+71.4 % of the between-window range, 8.2 % of total variance. This confirms
+run #2's 61 % rather than contradicting it, and adds the number that was
+missing: **a per-window constant explains only 11.5 % of the pooled target's
+variance at `recon_pool = 16`.** So 88.5 % of what the decoder is scored on is
+still temporal detail inside the window that a 16×256 latent set cannot carry.
+Pooling by 16 was not enough; run #2 already called a larger `recon_pool` "the
+obvious lever" and this prices it.
+
+Decoder output std is 0.2901, and 0.2901² = 0.084 against 0.082 variance
+explained. Those matching **is** MSE-optimal shrinkage under a mostly
+unpredictable target — not steganography, and not a capacity limit. Growing the
+decoder remains ruled out.
+
+### The frozen layer mixes are 99.7 % the same vector
+
+The checkpoint's mixes are bit-identical to `phase1_layer_weights.pt`
+(cosine 1.000000, max abs difference 5e-5), so `--freeze-layer-weights` did what
+it says and `inspect_phase1.py` here reports phase 1's result, not drift.
+
+| | content | style |
+|---|---|---|
+| cos to uniform | 0.9866 | 0.9942 |
+| max/min weight | 1.69 | 1.40 |
+
+`cos(content, style) = 0.9972`.
+
+The run-#2 freeze met the criterion **as written** — style's deviation from
+uniform had grown 7.2× and was annealing monotonically — and the criterion sets
+no numeric threshold. But in absolute terms both mixes sit within ~1 % cosine of
+uniform and are 99.7 % identical to each other. **That effectively answers the
+"cache one stream or two" question left open on 2026-09-01: one stream.** Two
+near-duplicate streams cannot justify 2× the phase-2 storage, and the honest
+thesis finding is that the per-branch layer mix did not earn its keep.
+
+### Decisions
+
+1. **Keep 40 kept pairs per work for w50 and w100.** Changing it now would
+   confound the curve — the design varies works and holds pairs-per-work fixed.
+   40 is also the better setting on this run's own evidence: it gives ~70 %
+   recording coverage against ~52 % at 20, and because the step budget is fixed,
+   more pairs mean *fewer passes* over each one (w100 will make ~10 against
+   w25's 40), which directly attacks cause 2 above.
+2. **Finish the curve before fixing anything.** The recon ceiling and the layer
+   mixes are on the reconstruction/style side; the overfitting is on the
+   contrastive/content side. w50 and w100 measure the slope in works, which is
+   what decides whether the 708 undownloaded works are worth fetching, and that
+   conclusion survives a later `recon_pool` change.
+3. **Do not extend the step budget.** 87,372 steps is ~23 % longer than useful
+   at w25. Keep it for comparability, and expect w100's `best.pt` to land later
+   in the run if works are the binding constraint.
+4. **Treat the negative queue and more works as fixes for different symptoms.**
+   More negatives attacks the *plateau* (a saturated 4-way task). More works
+   attacks the *train/val gap*. A queue does not add works, and with 241 works a
+   memorised work classifier still solves a 1,000-negative task — so it cannot
+   substitute for works.
+
+### Tooling added
+
+* **`scripts/diagnose_training.py`** — blocks a `train.log`'s per-step samples,
+  averages, and bootstraps the first-vs-last difference, because at 4 pairs a
+  single step's contrastive value swings ~1.7 regardless of progress. Validated
+  against synthetic logs of a learning run and a flat one.
+* **`train.py --overfit-batches N`** — trains on N fixed batches with validation
+  off, reseeding the window RNG each epoch so the *same* audio replays
+  (`windows.py` draws a fresh anchor per access, so without this "fixed batches"
+  would hold new windows each epoch). Losses that refuse to collapse indicate
+  capacity or optimisation rather than data.
+* **`inspect_phase1.py`** — the standardiser and steganography notes were
+  unconditional legend text that read as findings; both are now conditional, and
+  the "a per-window constant explains X % of this target" line was added, which
+  is the number that prices `recon_pool`. `--recon-pool` already existed, so the
+  pooling sweep needs no retraining to *measure*.
+* **`align_covers.py` now line-buffers stdout.** Piping to `tee` makes stdout a
+  pipe, which Python block-buffers at ~8 KB; the train chroma stage printed
+  nothing for hours and looked hung while working normally. The chroma progress
+  line now carries a rate and an ETA.
+
+---
+
+## 2026-09-27 — Two fixes, and why the learning curve had to be restructured
+
+`lc-w25` produced two distinct symptoms with two distinct causes (previous
+entry): a **plateau** from step ~60 k, caused by a saturated 4-way contrastive
+task, and a widening **train/val gap** from pass 7, caused by work memorisation
+over 241 works. Both are now addressed, and addressing them invalidated the
+experiment they were diagnosed from.
+
+### Fix 1 — contrastive negative queue
+
+`ContentQueue` in `src/losses.py`: a FIFO of recent pooled content vectors that
+`mil_nce` appends to the denominator. `--negative-queue N`, **default 1000**,
+`0` = off.
+
+* Only the **B-side candidates** are queued, tagged with their work, because
+  the B candidates are what populate the denominator.
+* **Queue entries of the anchor's own work are masked out**, exactly like
+  in-batch ones. Without that the queue would reintroduce the false negatives
+  the `mil_nce` mask exists to remove — at 241 works a 1,000-entry queue holds
+  ~4 entries of the anchor's own work at any moment.
+* **Buffers are non-persistent**, so the queue never enters a checkpoint: older
+  checkpoints still load, and a resumed run refills over ~250 steps.
+* **Validation does not use the queue**, so `val/contrastive` stays comparable
+  with the existing `val_metrics.jsonl` history.
+* Entries are detached and go stale as the encoder drifts. At 1,000 entries and
+  4 pushed per step that is 250 steps (~5 min) of history. Much larger would
+  want a momentum encoder (MoCo), which costs a second copy of the weights.
+
+Verified against a hand-computed loss to 1e-5; same-work masking leaves the
+affected row bit-identical; the FIFO evicts correctly and handles a batch larger
+than itself; entries are stored L2-normalised; `state_dict()` is empty; loss
+rises monotonically from 0 to 512 queued negatives.
+
+### Fix 2 — style-only augmentation
+
+`src/data/augment.py`: random EQ tilt, a resonant peak, a codec-like lowpass, a
+cheap reverb, tanh saturation, additive noise at a target SNR, and gain. All FFT
+or elementwise in pure torch — torchaudio is not installed on the DLAMI, and an
+IIR filter in Python would be far slower than filtering a spectrum. Loudness is
+renormalised before the gain step, or the level itself becomes a cue the encoder
+reads instead of the timbre change. `--augment`, **off by default**.
+
+**Pitch and tempo are deliberately not augmented.** Real covers already supply
+those, and `CLAUDE.md` wants key invariance to come from real transpositions.
+What remains is exactly the content/style split the project is built on, so the
+content encoder *should* be invariant to all of it.
+
+**Augmented windows never become reconstruction targets.** Augmentation applies
+to the pair's A-side window only, and `compute_losses` takes a new `recon_index`
+that excludes those windows from term 2a and from the Standardizer update.
+Fitting the decoder and the style branch to augmented audio would teach
+P(style | content) that lowpassed, saturated, reverberant signal is ordinary
+human style — which is the distribution the detector later scores against. The
+swap term is untouched, since it targets B.
+
+`scripts/check_augment.py` measures content preservation with the project's own
+metric (beat-synchronous chroma → OTI → Smith-Waterman) rather than assuming it.
+On synthetic music:
+
+| transform | score vs the clean self-alignment |
+|---|---|
+| gain, EQ tilt, EQ peak, lowpass, saturation | 100.0 % |
+| noise | 99.5 % |
+| **reverb** | **76.4 %** |
+| all defaults together | 73.5 % |
+
+Reverb smears transients, which blurs beat tracking and chroma together. Even so
+0.735 is far above the 0.2 keep threshold, so the aligner still calls it the
+same content. Re-measure on real audio before trusting it.
+
+**Found while testing:** augmentation originally drew from the global `random`
+stream, which shifted every later window draw — so an augment-on and an
+augment-off run sampled *different windows* and the ablation would have been
+confounded. It now uses `random.Random(torch.initial_seed() + index)`: same
+windows, same anchors, only the A waveform differs.
+
+### The learning curve had to be restructured
+
+A curve measures d(metric)/d(works) **under one configuration**. Both fixes
+change that derivative, in opposite directions:
+
+* **Augmentation substitutes for works.** It synthesises extra performances of a
+  work the model already has — the same resource the curve varies — so it should
+  **flatten** the curve.
+* **The queue may let the model exploit more works.** A model that keeps
+  receiving gradient about fine distinctions can use diversity a saturated one
+  ignores, so it should **steepen** it.
+
+Which dominates is not predictable, and the decision — fetch the remaining 708
+works or not — depends on the slope at the top end **under the configuration
+that ships**. Measuring it under the old configuration risks over-buying data
+(if augmentation would have sufficed) or under-buying it (if the fixes unlock
+more). There is also a plain accounting objection: a curve anchored on `lc-w25`
+measures how much more data helps a model that is broken in two known ways.
+
+**DECISION: two stages, each varying one thing.** `docs/learning_curve_runbook.md`
+is rewritten around it.
+
+| stage | runs | varies | holds fixed |
+|---|---|---|---|
+| **A** | `q-w25`, `qa-w25` (+ `lc-w25`, done) | the configuration | data (`train_w25`) |
+| **B** | `w50`, `w100` at A's winner | the data | the configuration |
+
+Four runs total, ~$90, ~2 days on two boxes at a time; `lc-w25` is stage A's
+third arm and stage A's winner is stage B's 25 % point, so neither is re-run.
+
+* **Everything keeps `lc-w25`'s 87,372-step budget and K = 40**, or nothing is
+  comparable.
+* **Stage A runs the full budget, not a cheap short version.** Ranking the
+  configurations in 25 k steps would cost a third as much — `lc-w25` was already
+  at 0.174 mAP by step 22,500 — but the queue's entire purpose is to prevent the
+  *late* saturation, so a short run would systematically under-measure it.
+* **The train/val contrastive gap is stage A's load-bearing number**, not just
+  the mAP. `lc-w25` ended at +0.618. A much smaller gap means memorisation was
+  genuinely reduced, which is also a free prediction that stage B's curve will
+  be flatter.
+* **Stage B's conclusion is conditional** and must be written that way: "at the
+  configuration we ship, works saturate at N", not "works saturate at N".
+* Three points give a slope per doubling. Extrapolate to 1,639 works (all
+  de-contaminated train works) and to ~10 k (SHS100K-v2 scale) before deciding;
+  Da-TACOS is ~1,000 works and SHS100K-v2 ~10 k, so ~970 is small for a
+  contrastive problem and a flat w50 → w100 step is evidence about this
+  configuration's appetite, not proof that data stopped mattering.
+
+**Footgun introduced:** `--negative-queue` defaults to 1000, so `lc-w25`'s
+configuration is no longer what a bare command produces. Reproducing or resuming
+it needs an explicit `--negative-queue 0`. `run_info.json` now records
+`negative_queue`, `n_candidates` and `augment`, so runs are self-describing.
+Also `train/contrastive` is no longer comparable across stage A — with a queue
+it is a ~1,000-way loss instead of 4-way.
+
+---
+
+## 2026-09-29 — Runs must not depend on shell state
+
+`launch qa-w25 train_w25 --negative-queue 1000 --augment` started, printed
+`data_root=/home/ubuntu/Tesis/data` and died on a missing
+`manifests/train_w25/tracks.jsonl`. The manifests were fine; the shell was not.
+`q-w25` had been launched from a pane where `$COMMON` and the `launch` function
+were defined, and the second pane had neither, so `--data-root`, `--val-split`,
+`--layer-weights`, `--freeze-layer-weights` and `--max-steps` were all silently
+absent and `train.py` fell back to the repo's own `data/`.
+
+This is box B blocker 1 in a new costume: **tmux panes do not inherit shell
+state defined in another pane.** The dangerous part is not that it failed — it
+is the failure mode of a run that *doesn't* fail. Had `~/Tesis/data/manifests`
+happened to contain a `train_w25`, the run would have trained on the wrong data,
+unfrozen the layer mixes, validated on the wrong split and stopped after the
+default 10 epochs, and nothing in the log would have said so.
+
+**Three fixes:**
+
+1. **`scripts/launch_run.sh`** (committed) holds everything that must be
+   identical across runs. It refuses to start without `$DATA`, checks every
+   manifest it needs and lists what is present when one is missing, derives the
+   budget from `train_w100`'s pair count so the number does not depend on the
+   split being launched, and echoes `run=… split=… steps=… data=…` before
+   starting. `steps=87372` must appear or nothing is comparable to `lc-w25`.
+   It also runs `python -u` (the chroma buffering lesson) and `tee -a`, so a
+   resumed run appends to `train.log` instead of truncating it.
+2. **`train.py` fails with the resolved root in the message** when
+   `manifests/{train_split}/tracks.jsonl` is absent, names the likely cause when
+   `--data-root` was not passed at all, and lists the splits that *are* present.
+3. **`--data-root` is parsed as a string, not a `Path`** — closing the open item
+   from box B blocker 2. `Path("")` collapses to `"."`, so after argparse an
+   empty `$DATA` was indistinguishable from an explicit current directory; as a
+   string it is caught with a message that names `$DATA`.
+
+Verified: `$DATA` unset, `$DATA` set but manifests absent, too few arguments,
+`--data-root ""`, `--data-root` omitted entirely, and that the budget resolves
+to 87,372 whether `train_w25` or `train_w100` is launched.
+
+---
+
 ## Open items
 
 Carried forward, not yet acted on:
 
-* `scripts/train.py` should reject an empty `--data-root` instead of resolving it
-  to `.`.
+* ~~`scripts/train.py` should reject an empty `--data-root` instead of resolving
+  it to `.`.~~ Fixed 2026-09-29: parsed as a string so `Path("")` cannot hide
+  it, plus a manifest-existence check that names the resolved root.
 * ~~`mil_nce` does not mask same-`song_id` negatives.~~ Fixed 2026-09-18
   (`groups` argument; `train.py` passes each pair's work id).
-* The contrastive number (0.36 vs. chance 1.386) is suggestive but weak evidence:
-  4-way discrimination is easy, and `n_candidates=1` means MIL-NCE degenerates to
-  plain InfoNCE. The lever for a stronger signal is `--n-candidates`, not a larger
-  batch.
+* ~~The contrastive number is weak evidence: 4-way discrimination is easy.~~
+  **Confirmed by measurement** 2026-09-27: at `batch_pairs 4` / `n_candidates 1`
+  each anchor gets 3 negatives, the loss saturates, and the plateau follows. The
+  lever is more negatives. **Implemented** 2026-09-27 as `ContentQueue`
+  (`--negative-queue`, default 1000); `--n-candidates` remains untried and is
+  complementary.
+* **Sweep `recon_pool`.** At 16, a per-window constant explains only 11.5 % of
+  the pooled target's variance, so the objective is ~9/10 irreducible. Measure
+  the share at 16/32/64/96 with `inspect_phase1.py --recon-pool` (no retraining
+  needed for the baselines) before picking a new value.
+* **Nothing regularises the content path**: `EncoderConfig.dropout = 0.0`,
+  `weight_decay = 0.01`, 50.4 M parameters per encoder, 241 works in w25.
+  Augmentation is now implemented (`--augment`) and keeps off the
+  reconstruction target; **dropout is still 0.0 and untried**, and is the
+  cheapest remaining lever.
+* **`--kept-per-song` could be work-aware.** A flat K spends the budget badly at
+  both ends: `clamp(n_w, 20, 100)` reaches ~84 % recording coverage against 70 %
+  at flat 40, still keeps the largest work at 0.24 % of all pairs, and needs
+  ~100 k candidate alignments (~0.3 core-hours). Deferred until the curve is in,
+  because changing it mid-curve would confound it.
 * `log_layer_weights` should also log the cosine between successive deviations
   from uniform — the plain softmax cosine is insensitive (see run #2 entry).
 * `.gitignore`'s `checkpoionts/` typo is fixed; the stray `IGNORE` lines remain.
@@ -660,7 +1026,21 @@ Carried forward, not yet acted on:
   windows do feed loss 2a, so this is a diversity question, not a blocker.
 * `extract_mixes`' docstring overstates what micro-batching achieves (see bug 5
   above).
-* Validation runs in fp32 (no autocast). That is harmless, but with ~950 val50
-  pairs a pass takes ~5 min. `--val-max-batches` is the lever if it matters.
+* Validation runs in fp32 (no autocast). That is harmless, but val50 turned out
+  to hold 1,703 pairs, so a pass is ~426 batches. `--val-max-batches` is the
+  lever if it matters; the val order is a fixed permutation, so a capped pass is
+  the same subset every time. Note the retrieval metrics pool the *whole* pass,
+  so a cap makes the task easier and must be held constant across comparisons.
 * The learning-curve intervals cover test-set sampling, not training seeds. A
   borderline w50 → w100 call needs a second seed of w100.
+* **Queue entries go stale.** They are detached and never re-encoded, so at
+  much more than ~1,000 entries a momentum encoder (MoCo) would be needed. The
+  current default is sized so the queue holds ~250 steps of history.
+* **`check_augment.py` has only been run on synthetic audio.** Re-measure on
+  real tracks before trusting the 76 % reverb figure, and turn `reverb_seconds`
+  down if it is worse there.
+* ~~Phase 2: cache one stream or two?~~ Effectively answered 2026-09-27:
+  `cos(content, style) = 0.9972` and both mixes are within ~1 % cosine of
+  uniform, so **one stream**. The per-batch sequence correlation that
+  `extract_mert_features.py` reports is still worth reading on real pairs before
+  the cache is built, but only as a confirmation.
