@@ -307,17 +307,17 @@ def save_checkpoint(
     )
 
 
-def write_run_info(
-    checkpoint_dir: Path,
+def run_info_dict(
     config: TrainConfig,
-    pair_loader: DataLoader,
-    track_loader: DataLoader | None,
+    pairs: list,
+    tracks: list,
     total_steps: int,
-) -> None:
-    """What this run trained on, next to its checkpoints (read by learning_curve.py)."""
-    pairs = pair_loader.dataset.pairs
-    tracks = track_loader.dataset.tracks if track_loader is not None else []
-    info = {
+    started: str | None = None,
+) -> dict:
+    """What a run trained on. Shared with scripts/rebuild_run_info.py, which
+    reconstructs this file from a checkpoint when it is lost, so the two can
+    never disagree about which fields a run is described by."""
+    return {
         "train_split": config.data.train_split,
         "val_split": config.data.val_split,
         "n_pairs": len(pairs),
@@ -333,8 +333,24 @@ def write_run_info(
         "layer_weights": config.layer_weights,
         "freeze_layer_weights": config.freeze_layer_weights,
         "seed": config.seed,
-        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started": started or time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def write_run_info(
+    checkpoint_dir: Path,
+    config: TrainConfig,
+    pair_loader: DataLoader,
+    track_loader: DataLoader | None,
+    total_steps: int,
+) -> None:
+    """Write run_info.json next to the checkpoints (read by learning_curve.py)."""
+    info = run_info_dict(
+        config,
+        pair_loader.dataset.pairs,
+        tracks=track_loader.dataset.tracks if track_loader is not None else [],
+        total_steps=total_steps,
+    )
     with open(checkpoint_dir / "run_info.json", "w", encoding="utf-8") as f:
         json.dump(info, f, indent=1)
 
