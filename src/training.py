@@ -172,6 +172,7 @@ def compute_losses(
     song_ids: torch.Tensor | None = None,
     queue: tuple[torch.Tensor, torch.Tensor] | None = None,
     recon_index: torch.Tensor | None = None,
+    keys: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """All objectives for one batch.
 
@@ -183,6 +184,12 @@ def compute_losses(
     being contrasted as negatives (see mil_nce).
 
     queue holds extra contrastive negatives from earlier steps (ContentQueue).
+
+    keys, (P*K, D), are the B-side vectors from the momentum encoder. When a
+    queue is in use they replace the online encoder's B-side output as the
+    contrastive positives, so the positive and the queued negatives come from
+    the same (slowly moving) encoder. Without that the model can separate them
+    by age instead of by content and the representation collapses.
 
     recon_index selects which windows the plain reconstruction term 2a is scored
     on; None means every window. It exists so augmented windows can feed the
@@ -217,7 +224,9 @@ def compute_losses(
     # 1. contrastive on content tokens (MIL-NCE over the K candidates)
     if p > 0 and loss_config.contrastive_weight > 0:
         anchors = pool_tokens(content[:p])
-        candidates = pool_tokens(content[p : p + p * k]).view(p, k, -1)
+        candidates = (
+            keys if keys is not None else pool_tokens(content[p : p + p * k])
+        ).view(p, k, -1)
         losses["contrastive"] = mil_nce(
             anchors, candidates, loss_config.temperature, song_ids, queue
         )

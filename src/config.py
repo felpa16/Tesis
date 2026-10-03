@@ -57,8 +57,11 @@ class LossConfig:
     cycle_weight: float = 0.25  # 2c latent cycle-consistency
     decorrelation_weight: float = 0.1
     temperature: float = 0.1  # contrastive temperature
-    negative_queue: int = 1000  # extra contrastive negatives kept from
-    # earlier steps (0 = off). 3 in-batch negatives saturate the loss.
+    negative_queue: int = 0  # extra contrastive negatives kept from earlier
+    # steps (0 = off). Default off until a real run validates the momentum
+    # encoder: without one, a queue collapses the content representation
+    # (timeline.md, 2026-10-03).
+    queue_momentum: float = 0.999  # EMA rate of the key encoder that fills it
     cosine_weight: float = 0.0  # optional cosine term in reconstruction
     recon_pool: int = 16  # temporal pooling of the reconstruction target; 1 = off
     cycle_fraction: float = 0.5  # fraction of the batch used for 2c

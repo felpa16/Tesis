@@ -12,3 +12,4 @@ __pycache__/
 shs-100k/
 yt-dlp/
 IGNORE
+.pem

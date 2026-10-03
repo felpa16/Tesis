@@ -2,6 +2,7 @@
 
 1. mil_nce            — contrastive loss on content tokens (K=1 -> InfoNCE)
    ContentQueue       — FIFO of recent content vectors, extra negatives for it
+   MomentumContentEncoder — the EMA encoder that makes that queue sound
 2. pool_frames        — temporal pooling of the reconstruction target
    standardized_mse   — reconstruction terms 2a/2b on standardized mixes
    cycle_loss         — term 2c, decode-swap-re-encode with detached targets
@@ -9,6 +10,8 @@
 """
 
 from __future__ import annotations
+
+import copy
 
 import torch
 import torch.nn as nn
@@ -152,6 +155,56 @@ class ContentQueue(nn.Module):
         self.works[index] = works.to(self.works.device)
         self.cursor.fill_((int(self.cursor) + n) % self.size)
         self.filled.fill_(min(int(self.filled) + n, self.size))
+
+
+class MomentumContentEncoder(nn.Module):
+    """EMA copy of the content path, producing the keys a ContentQueue holds.
+
+    Without this a queue is not merely stale, it is *mis-specified*. The
+    positive is produced by the current encoder while the queued negatives were
+    produced by older ones, so "was this vector made by the encoder as it is
+    now, or as it was a few steps ago" separates the positive from every queued
+    negative without reference to musical content at all. That is the cheaper
+    objective, gradient descent takes it, and the representation collapses:
+    measured 2026-10-02/03, where `q-w25` and `q16-w25` both sat at exactly
+    ln(number of candidates) — a uniform softmax — for tens of thousands of
+    steps while the no-queue control trained normally.
+
+    MoCo's fix, implemented here: encode the keys with a slowly-moving copy of
+    the content path and take the positive from *that* same copy, so the
+    positive and the queued negatives come from one distribution and age stops
+    being a usable feature.
+
+    Not checkpointed. A resumed run rebuilds it from the current weights, which
+    is a close approximation and avoids changing the checkpoint format.
+    """
+
+    def __init__(self, model: DisentanglementModel, momentum: float = 0.999) -> None:
+        super().__init__()
+        self.momentum = float(momentum)
+        self.encoder = copy.deepcopy(model.content_encoder)
+        self.bottleneck = copy.deepcopy(model.content_bottleneck)
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: DisentanglementModel) -> None:
+        """key <- m * key + (1 - m) * query, after the optimizer has stepped."""
+        m = self.momentum
+        pairs = (
+            (self.encoder, model.content_encoder),
+            (self.bottleneck, model.content_bottleneck),
+        )
+        for target, source in pairs:
+            for pt, ps in zip(target.parameters(), source.parameters()):
+                pt.mul_(m).add_(ps.detach(), alpha=1.0 - m)
+            for bt, bs in zip(target.buffers(), source.buffers()):
+                bt.copy_(bs)
+
+    @torch.no_grad()
+    def forward(self, content_mix: torch.Tensor) -> torch.Tensor:
+        """Content mix -> pooled, L2-normalized key vectors (B, token_dim)."""
+        return pool_tokens(self.bottleneck(self.encoder(content_mix)))
 
 
 def standardized_mse(

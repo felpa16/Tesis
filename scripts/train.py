@@ -62,7 +62,11 @@ from src.data import (  # noqa: E402
     read_pairs,
     read_tracks,
 )
-from src.losses import ContentQueue, pool_tokens  # noqa: E402
+from src.losses import (  # noqa: E402
+    ContentQueue,
+    MomentumContentEncoder,
+    pool_tokens,
+)
 from src.metrics import content_retrieval  # noqa: E402
 from src.models import DisentanglementModel, MertExtractor  # noqa: E402
 from src.training import (  # noqa: E402
@@ -102,8 +106,14 @@ def build_train_loaders(
     # and silently drops any pair whose two recordings are missing from it.
     overfit_tracks = tracks
     if config.overfit_batches:
-        pairs = pairs[: config.overfit_batches * config.data.batch_pairs]
-        overfit_tracks = tracks[: config.overfit_batches * config.data.batch_tracks]
+        want = config.overfit_batches * config.data.batch_pairs
+        # Stride, never a head slice: manifests list a work's pairs
+        # contiguously, so pairs[:want] is one work, every in-batch negative is
+        # masked as same-work, and the contrastive term reads exactly 0.0000 —
+        # which is what the first version of this probe reported.
+        pairs = pairs[:: max(len(pairs) // want, 1)][:want]
+        overfit_tracks = tracks[:: max(len(tracks) // max(
+            config.overfit_batches * config.data.batch_tracks, 1), 1)]
     pair_dataset = AlignedPairDataset(
         pairs,
         tracks,
@@ -329,6 +339,7 @@ def run_info_dict(
         "batch_tracks": config.data.batch_tracks,
         "n_candidates": config.data.n_candidates,
         "negative_queue": config.loss.negative_queue,
+        "queue_momentum": config.loss.queue_momentum,
         "augment": config.data.augment.enabled,
         "layer_weights": config.layer_weights,
         "freeze_layer_weights": config.freeze_layer_weights,
@@ -416,6 +427,13 @@ def parse_args() -> argparse.Namespace:
         "which is capped by MERT activation memory",
     )
     parser.add_argument(
+        "--queue-momentum",
+        type=float,
+        help="EMA rate of the key encoder that fills the queue (default 0.999). "
+        "Lower moves the keys faster and makes them staler relative to each "
+        "other; 1.0 freezes them at initialization",
+    )
+    parser.add_argument(
         "--overfit-batches",
         type=int,
         help="train on this many fixed batches, replayed every epoch, with "
@@ -458,6 +476,7 @@ def apply_overrides(config: TrainConfig, args: argparse.Namespace) -> None:
         (args.val_every, lambda v: setattr(direct, "val_every", v)),
         (args.overfit_batches, lambda v: setattr(direct, "overfit_batches", v)),
         (args.negative_queue, lambda v: setattr(config.loss, "negative_queue", v)),
+        (args.queue_momentum, lambda v: setattr(config.loss, "queue_momentum", v)),
         (args.augment or None, lambda v: setattr(config.data.augment, "enabled", v)),
         (args.select_metric, lambda v: setattr(direct, "select_metric", v)),
     ]
@@ -622,14 +641,21 @@ def main() -> None:
                 json.dump(record, f, indent=1)
             print(f"  new best {config.select_metric}={value:.4f} -> best.pt")
 
-    queue = None
+    queue, momentum_encoder = None, None
     if config.loss.negative_queue > 0 and config.loss.contrastive_weight > 0:
         queue = ContentQueue(
             config.loss.negative_queue, config.bottleneck.token_dim
         ).to(device)
+        # Mandatory, not optional: a queue without it collapses the content
+        # representation, because the positive and the queued negatives then
+        # come from different encoders and can be told apart by age.
+        momentum_encoder = MomentumContentEncoder(
+            model, config.loss.queue_momentum
+        ).to(device)
         print(
             f"contrastive negatives: {config.data.batch_pairs * config.data.n_candidates - 1}"
-            f" in-batch + up to {config.loss.negative_queue} queued"
+            f" in-batch + up to {config.loss.negative_queue} queued; keys from a"
+            f" momentum encoder (m={config.loss.queue_momentum})"
         )
 
     track_iter = repeat_forever(track_loader) if track_loader is not None else None
@@ -669,6 +695,9 @@ def main() -> None:
                     style_target if recon_index is None else style_target[recon_index]
                 )
                 content, style = model.encode_mixes(content_mix, style_mix)
+                keys = None
+                if momentum_encoder is not None and p > 0:
+                    keys = momentum_encoder(content_mix[p : p + p * k])
                 total, losses = compute_losses(
                     model,
                     config.loss,
@@ -681,14 +710,12 @@ def main() -> None:
                     song_ids,
                     queue.negatives() if queue is not None else None,
                     recon_index,
+                    keys,
                 )
-            if queue is not None and p > 0:
-                # the B-side candidates are what populates the denominator, so
-                # they are what gets queued, tagged with their work
-                queue.push(
-                    pool_tokens(content[p : p + p * k]),
-                    song_ids.repeat_interleave(k),
-                )
+            if queue is not None and keys is not None:
+                # queue exactly what served as the positive, so the denominator
+                # and the numerator are drawn from one distribution
+                queue.push(keys, song_ids.repeat_interleave(k))
 
             optimizer.zero_grad(set_to_none=True)
             total.backward()
@@ -697,6 +724,8 @@ def main() -> None:
             )
             optimizer.step()
             scheduler.step()
+            if momentum_encoder is not None:
+                momentum_encoder.update(model)
             global_step += 1
             # detached tensors, not floats: float() would sync the GPU every step
             interval["total"] += total.detach()
