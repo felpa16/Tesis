@@ -592,6 +592,19 @@ def main() -> None:
     writer.add_text("config", f"```json\n{config.to_dict()}\n```")
     checkpoint_dir = Path(config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # val_metrics.jsonl is opened in append mode so a resumed run continues one
+    # file. That makes a *fresh* run into a used directory silently interleave
+    # two trajectories, and run_info.json/best.pt describe whichever ran last.
+    # Refuse instead: the usual cause is a forgotten --checkpoint-dir, which is
+    # how checkpoints/ itself collected three runs (timeline.md, 2026-10-03).
+    metrics_path = checkpoint_dir / "val_metrics.jsonl"
+    if args.resume is None and metrics_path.exists():
+        raise SystemExit(
+            f"{metrics_path} already exists, so this directory holds another "
+            f"run. Pass --checkpoint-dir checkpoints/<run-name> (what "
+            f"scripts/launch_run.sh does), --resume to continue that run, or "
+            f"move the directory aside."
+        )
     write_run_info(checkpoint_dir, config, pair_loader, track_loader, total_steps)
     autocast = (
         torch.autocast("cuda", dtype=torch.bfloat16)

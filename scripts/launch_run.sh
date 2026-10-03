@@ -59,6 +59,7 @@ python -u scripts/train.py \
     --data-root "$DATA" \
     --train-split "$SPLIT" \
     --val-split val50 \
+    --checkpoint-dir "checkpoints/$RUN" --log-dir "runs/$RUN" \
     --layer-weights phase1_layer_weights.pt --freeze-layer-weights \
     --batch-pairs 4 --batch-tracks 4 --num-workers 4 \
     --max-steps "$STEPS" --val-every 2500 --checkpoint-every 500 \
