@@ -72,7 +72,9 @@ from src.models import DisentanglementModel, MertExtractor  # noqa: E402
 from src.training import (  # noqa: E402
     compute_losses,
     extract_mixes,
+    LayerMixConvergence,
     load_layer_weights,
+    save_layer_weights,
     make_optimizer,
     make_scheduler,
     pick_device,
@@ -402,6 +404,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--freeze-layer-weights", action="store_true")
     parser.add_argument(
+        "--unfreeze-layer-weights",
+        action="store_true",
+        help="reset both MERT layer mixes to uniform and train them for the "
+        "whole run. Overrides --layer-weights and --freeze-layer-weights, "
+        "which scripts/launch_run.sh always passes, so this is how you opt "
+        "out of them without bypassing that script's guards. The mix "
+        "trajectory is reported every --converge-every steps so you can see "
+        "afterwards whether it settled; use --converge-mert instead to stop "
+        "the run once it has",
+    )
+    parser.add_argument(
         "--layer-weights",
         type=Path,
         help="phase-1 layer-weights file to start both mixes from "
@@ -444,6 +457,44 @@ def parse_args() -> argparse.Namespace:
         "--select-metric",
         help="validation metric that picks best.pt (default val/total; "
         "recall/map metrics are maximized, everything else minimized)",
+    )
+    parser.add_argument(
+        "--converge-mert",
+        action="store_true",
+        help="reset both MERT layer mixes to uniform, train them, and stop "
+        "when they stop moving. Overrides --layer-weights and "
+        "--freeze-layer-weights. Writes the converged vectors to "
+        "{checkpoint-dir}/phase1_layer_weights.pt for --layer-weights and "
+        "scripts/extract_mert_features.py to consume",
+    )
+    parser.add_argument(
+        "--converge-every",
+        type=int,
+        default=500,
+        help="steps between layer-mix samples (default 500)",
+    )
+    parser.add_argument(
+        "--converge-window",
+        type=int,
+        default=4,
+        help="compare against the sample this many checks ago, so the lag is "
+        "--converge-every x this (default 4 = 2000 steps)",
+    )
+    parser.add_argument(
+        "--converge-tol",
+        type=float,
+        default=0.02,
+        help="converged when ||w_now - w_then|| / ||w_now - uniform|| is below "
+        "this for both branches (default 0.02, i.e. 2%% of the distance the "
+        "vector has travelled from uniform). An *absolute* threshold cannot "
+        "work: the whole journey from uniform is only ~0.033 in norm, so e.g. "
+        "MSE < 1e-3 is satisfied at step 0",
+    )
+    parser.add_argument(
+        "--converge-patience",
+        type=int,
+        default=3,
+        help="consecutive passing checks required (default 3)",
     )
     parser.add_argument("--resume", type=Path, help="checkpoint to resume from")
     return parser.parse_args()
@@ -553,7 +604,27 @@ def main() -> None:
     )
 
     model = DisentanglementModel(config).to(device)
-    if args.resume is None and config.layer_weights:
+    # --converge-mert owns the layer mixes: they start uniform, stay trainable,
+    # and the run exists to stop when they settle. Honouring --layer-weights or
+    # --freeze-layer-weights here would answer a different question, and
+    # launch_run.sh passes both on every invocation, so override rather than
+    # ask the caller to drop them.
+    if args.unfreeze_layer_weights or args.converge_mert:
+        flag = "--converge-mert" if args.converge_mert else "--unfreeze-layer-weights"
+        if config.layer_weights or config.freeze_layer_weights:
+            print(
+                f"{flag}: ignoring --layer-weights / --freeze-layer-weights; "
+                f"the mixes start uniform and train"
+            )
+        config.layer_weights = ""
+        config.freeze_layer_weights = False
+        with torch.no_grad():
+            model.content_mix.weights.zero_()  # softmax(zeros) = uniform 1/25
+            model.style_mix.weights.zero_()
+        model.content_mix.weights.requires_grad_(True)
+        model.style_mix.weights.requires_grad_(True)
+        print(f"{flag}: both layer mixes reset to uniform and unfrozen")
+    elif args.resume is None and config.layer_weights:
         load_layer_weights(model, Path(config.layer_weights), config.loss.recon_pool)
         print(f"layer-mix weights loaded from {config.layer_weights}")
     if config.freeze_layer_weights:
@@ -653,6 +724,17 @@ def main() -> None:
             with open(checkpoint_dir / "best_metrics.json", "w", encoding="utf-8") as f:
                 json.dump(record, f, indent=1)
             print(f"  new best {config.select_metric}={value:.4f} -> best.pt")
+
+    convergence = (
+        LayerMixConvergence(
+            tol=args.converge_tol,
+            window=args.converge_window,
+            patience=args.converge_patience,
+        )
+        if args.converge_mert or args.unfreeze_layer_weights
+        else None
+    )
+    mixes_saved = False
 
     queue, momentum_encoder = None, None
     if config.loss.negative_queue > 0 and config.loss.contrastive_weight > 0:
@@ -777,6 +859,29 @@ def main() -> None:
                     checkpoint_dir / "last.pt", model, optimizer, scheduler,
                     config, epoch, global_step, prev_weights, best,
                 )
+            if convergence is not None and global_step % args.converge_every == 0:
+                mixes = model.layer_weight_summary()
+                settled, line = convergence.update(mixes)
+                print(f"  [layer mix @ {global_step}] {line}")
+                if settled and not mixes_saved:
+                    mixes_saved = True
+                    for warning in convergence.warnings(mixes):
+                        print(f"  warning: {warning}")
+                    save_layer_weights(
+                        checkpoint_dir / "phase1_layer_weights.pt",
+                        model, config, global_step,
+                    )
+                    print(
+                        f"layer mixes converged at step {global_step} -> "
+                        f"{checkpoint_dir / 'phase1_layer_weights.pt'}"
+                    )
+                    # --converge-mert exists only to produce that file, so it
+                    # stops here. --unfreeze-layer-weights is a normal training
+                    # run that happens to also train the mixes: it keeps going,
+                    # and the saved file records where they settled.
+                    if args.converge_mert:
+                        done = True
+                        break
             if config.max_steps and global_step >= config.max_steps:
                 done = True
                 break

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from src.config import LossConfig, TrainConfig
 from src.losses import (
@@ -124,6 +125,120 @@ def load_layer_weights(
         std.mean.copy_(mean)
         std.var.copy_(var)
         std.initialized.fill_(True)
+
+
+class LayerMixConvergence:
+    """Stopping rule for a run whose only job is to converge the layer mixes.
+
+    Scale is the whole difficulty here, so the test is *relative*. Both
+    vectors are a softmax over 25 hidden states: they start at 0.04 each, and
+    the entire journey from uniform to a converged mix is small — run #2's
+    content vector ended at ||w - uniform|| = 0.033, i.e. an MSE of 4.4e-5
+    against uniform. An absolute MSE threshold is therefore worse than useless:
+    MSE < 1e-3 means ||delta|| < 0.158, almost five times the whole journey, so
+    it is satisfied before the first step and would "converge" instantly.
+
+    So: has each vector moved less than `tol` of how far it has come from
+    uniform, measured over the last `window` samples, `patience` checks
+    running? That is condition 1 of the CLAUDE.md freeze criterion with a
+    meaningful scale attached.
+
+    Conditions 2 and 3 are *reported*, never used to stop. A vector that never
+    left uniform passes every stationarity test there is (CLAUDE.md), and run
+    #1's style vector did exactly that because its only gradient source was
+    degenerate — so `warn_cos_uniform` flags a mix that has not actually
+    selected anything, and the caller is expected to check its objective is
+    learning before trusting the file.
+    """
+
+    def __init__(
+        self,
+        tol: float = 0.02,
+        window: int = 4,
+        patience: int = 3,
+        warn_cos_uniform: float = 0.9995,
+    ) -> None:
+        self.tol = float(tol)
+        self.window = int(window)
+        self.patience = int(patience)
+        self.warn_cos_uniform = float(warn_cos_uniform)
+        self.history: dict[str, list[torch.Tensor]] = {}
+        self.passes = 0
+
+    def update(self, weights: dict[str, torch.Tensor]) -> tuple[bool, str]:
+        """Record one sample; return (converged, a line to print)."""
+        parts, moved = [], []
+        for branch, w in sorted(weights.items()):
+            w = w.detach().float().cpu()
+            n = w.numel()
+            uniform = torch.full((n,), 1.0 / n)
+            deviation = float((w - uniform).norm())
+            past = self.history.setdefault(branch, [])
+            past.append(w)
+            if len(past) > self.window + 1:
+                past.pop(0)
+
+            if len(past) > self.window:
+                delta = float((w - past[0]).norm())
+                # relative to the journey so far, not to the weights themselves
+                relative = delta / max(deviation, 1e-12)
+                moved.append(relative)
+                parts.append(
+                    f"{branch} moved {relative:7.4f} of its {deviation:.4f} "
+                    f"departure (cos to uniform {float(F.cosine_similarity(w, uniform, dim=0)):.4f}, "
+                    f"max/min {float(w.max() / w.min().clamp_min(1e-12)):.2f}x)"
+                )
+            else:
+                parts.append(
+                    f"{branch} warming up ({len(past)}/{self.window + 1} samples), "
+                    f"departure {deviation:.4f}"
+                )
+
+        if moved and max(moved) < self.tol:
+            self.passes += 1
+        else:
+            self.passes = 0
+        converged = self.passes >= self.patience
+        suffix = f"  [{self.passes}/{self.patience} consecutive]" if moved else ""
+        return converged, "; ".join(parts) + suffix
+
+    def warnings(self, weights: dict[str, torch.Tensor]) -> list[str]:
+        """Branches that converged without ever leaving uniform."""
+        out = []
+        for branch, w in sorted(weights.items()):
+            w = w.detach().float().cpu()
+            uniform = torch.full((w.numel(),), 1.0 / w.numel())
+            cosine = float(F.cosine_similarity(w, uniform, dim=0))
+            if cosine > self.warn_cos_uniform:
+                out.append(
+                    f"{branch}: cos to uniform {cosine:.6f} — this vector never "
+                    f"left its initialization, so its stationarity means nothing. "
+                    f"Check that the objective driving it is learning "
+                    f"(scripts/inspect_phase1.py) before freezing it."
+                )
+        return out
+
+
+def save_layer_weights(
+    path: Path, model: DisentanglementModel, config: TrainConfig, step: int
+) -> None:
+    """Write the two mixes in the format load_layer_weights() reads.
+
+    Carries the logits (what the model restores), their softmax as a
+    round-trip check, the Standardizer statistics, and the config — the
+    statistics are only reusable at the same recon_pool, which is why
+    load_layer_weights checks it.
+    """
+    payload: dict = {"config": config.to_dict(), "step": step}
+    for branch, mix, std in (
+        ("content", model.content_mix, model.content_std),
+        ("style", model.style_mix, model.style_std),
+    ):
+        payload[f"{branch}_logits"] = mix.weights.detach().cpu().clone()
+        payload[f"{branch}_softmax"] = mix.softmax_weights.detach().cpu().clone()
+        payload[f"{branch}_std_mean"] = std.mean.detach().cpu().clone()
+        payload[f"{branch}_std_var"] = std.var.detach().cpu().clone()
+    torch.save(payload, path)
 
 
 def extract_mixes(
