@@ -17,8 +17,8 @@ Resumable: finished shards are skipped, and the run refuses to extend a cache
 built with different settings.
 
 Examples:
-    python scripts/cache_pooled_mert.py --split train --out-dir cache/pooled/train
-    python scripts/cache_pooled_mert.py --split val50 --out-dir cache/pooled/val50
+    python scripts/cache_pooled_mert.py --split train --out-dir cache/pooled/train --data-root $DATA
+    python scripts/cache_pooled_mert.py --split val50 --out-dir cache/pooled/val50 --data-root $DATA
     # local smoke run
     python scripts/cache_pooled_mert.py --split val --out-dir /tmp/pc --max-tracks 2 \\
         --windows-per-track 1 --window-seconds 5 --device cpu --num-workers 0
@@ -70,13 +70,16 @@ class WindowList(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         item = self.items[index]
+        path = self.data_root / item["audio"]
         try:
-            wave = decode_window(self.data_root / item["audio"], item["start"], self.config)
-            ok = True
-        except Exception:  # noqa: BLE001 - one unreadable file must not stop a 4-hour run
+            wave = decode_window(path, item["start"], self.config)
+            ok, error = True, ""
+        except Exception as exc:  # noqa: BLE001 - one unreadable file must not stop a 4-hour run
             wave = torch.zeros(self.config.window_samples)
             ok = False
-        return {"wave": wave, "index": index, "ok": ok}
+            stderr = getattr(exc, "stderr", b"") or b""
+            error = f"{path}: {stderr.decode(errors='replace').strip() or exc!r}"
+        return {"wave": wave, "index": index, "ok": ok, "error": error}
 
 
 def plan_windows(tracks, window_seconds: float, per_track: int, max_tracks: int, seed: int) -> list[dict]:
@@ -171,6 +174,8 @@ def main() -> None:
         pooled, rows = [], []
         for batch in loader:
             ok = batch["ok"]
+            for error in [e for e in batch["error"] if e][: max(0, 3 - n_failed)]:
+                print(f"decode failed: {error}", flush=True)
             if not ok.any():
                 n_failed += len(ok)
                 continue
@@ -182,8 +187,12 @@ def main() -> None:
             ]
             n_failed += int((~ok).sum())
             n_done += int(ok.sum())
-        if rows:
-            write_shard(args.out_dir, shard, np.concatenate(pooled), rows)
+        if not rows:
+            raise SystemExit(
+                f"shard {shard + 1}: every window failed to decode; check --data-root "
+                f"({args.data_root}) and that ffmpeg is installed"
+            )
+        write_shard(args.out_dir, shard, np.concatenate(pooled), rows)
         rate = n_done / max(time.time() - started, 1e-9)
         left = sum(
             min(args.shard_size, len(items) - s * args.shard_size) for s in todo if s > shard
