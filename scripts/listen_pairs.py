@@ -18,6 +18,10 @@ Pairs are taken from the same place training takes them, in this order:
      files themselves, filtered by --min-score and, if selection_k{K}.json is
      present, by the per-work selection (--kept-per-song). Same anchors as 2.
 
+Audio is read from --data-root ($DATA on the boxes); alignments from
+--alignment-root, which defaults to whichever of --data-root and the repo's
+data/ actually holds alignments/{split}.
+
 Audio is decoded with src.data.windows.decode_window: 24 kHz mono, the exact
 waveform MERT sees. Tracks missing from data/audio/{split}/ are fetched with
 the aws CLI from --audio-s3 (the AUDIO_S3 prefix of the runbook) into
@@ -50,7 +54,7 @@ import random
 import subprocess
 import sys
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -99,11 +103,14 @@ class Candidate:
 
 
 def pairs_from_alignments(
-    data_root: Path, split: str, min_score: float, kept_per_song: int
+    alignment_root: Path, split: str, min_score: float, kept_per_song: int
 ) -> list[PairEntry]:
-    """PairEntry for every alignment that passes the training filters."""
-    directory = alignment_dir(data_root, split)
-    selection = selection_path(data_root, split, kept_per_song)
+    """PairEntry for every alignment that passes the training filters.
+
+    `alignment` in each entry is relative to alignment_root.
+    """
+    directory = alignment_dir(alignment_root, split)
+    selection = selection_path(alignment_root, split, kept_per_song)
     if kept_per_song > 0 and selection.exists():
         with open(selection, encoding="utf-8") as f:
             works = json.load(f)["works"]
@@ -114,7 +121,7 @@ def pairs_from_alignments(
             print(f"no selection at {selection}; using every alignment above --min-score")
         paths = sorted(directory.glob("*.npz"))
 
-    downloaded = _downloaded_files(data_root, split)
+    downloaded = _downloaded_files(alignment_root, split)
     pairs = []
     skipped = {"not downloaded": 0, "missing file": 0, "below --min-score": 0}
     for path in paths:
@@ -139,7 +146,7 @@ def pairs_from_alignments(
                 song_id=song_id,
                 score=score,
                 oti=int(data["oti"]),
-                alignment=str(path.relative_to(data_root)),
+                alignment=str(path.relative_to(alignment_root)),
                 t_a_first=float(t_a[0]),
                 t_a_last=float(t_a[-1]),
                 t_b_first=float(t_b[0]),
@@ -153,7 +160,11 @@ def pairs_from_alignments(
 
 
 def load_candidates(
-    data_root: Path, split: str, min_score: float, kept_per_song: int
+    data_root: Path,
+    alignment_root: Path,
+    split: str,
+    min_score: float,
+    kept_per_song: int,
 ) -> list[Candidate]:
     directory = manifest_dir(data_root, split)
     window_pairs = directory / "window_pairs.jsonl"
@@ -169,7 +180,7 @@ def load_candidates(
         print(f"pairs from {pairs_file}")
         pairs = read_pairs(data_root, split)
     else:
-        alignments = alignment_dir(data_root, split)
+        alignments = alignment_dir(alignment_root, split)
         print(f"no manifest pairs at {pairs_file}; reading {alignments}")
         if not alignments.is_dir():
             manifests = sorted(
@@ -177,11 +188,11 @@ def load_candidates(
                 if (d / "pairs.jsonl").exists()
             )
             raise SystemExit(
-                f"{alignments} does not exist. Is --data-root right (it defaults to "
-                f"$DATA, else the repo's data/)? Manifests with pairs under "
-                f"{data_root}: {', '.join(manifests) or 'none'}"
+                f"{alignments} does not exist. Pass --alignment-root (the folder "
+                f"holding alignments/), or a manifest as --split. Manifests with "
+                f"pairs under {data_root}: {', '.join(manifests) or 'none'}"
             )
-        pairs = pairs_from_alignments(data_root, split, min_score, kept_per_song)
+        pairs = pairs_from_alignments(alignment_root, split, min_score, kept_per_song)
     return [Candidate(p.song_id, p.key_a, p.key_b, p.score, p.oti, pair=p) for p in pairs]
 
 
@@ -195,6 +206,30 @@ def choose(candidates: list[Candidate], n: int, rng: random.Random) -> list[Cand
         print(f"warning: only {len(by_song)} works have pairs; writing {len(by_song)}")
     songs = rng.sample(sorted(by_song), min(n, len(by_song)))
     return [rng.choice(by_song[s]) for s in songs]
+
+
+def default_alignment_root(data_root: Path, split: str) -> Path:
+    """The first of data_root and the repo's data/ that holds alignments/{split}.
+
+    On the GPU boxes the audio lives under $DATA while the alignments may stay
+    in the repo checkout, so the two roots are resolved separately.
+    """
+    for root in (data_root, DEFAULT_DATA_ROOT):
+        if alignment_dir(root, split).is_dir():
+            return root
+    return data_root
+
+
+def resolve_alignment(pair: PairEntry, roots: list[Path]) -> PairEntry:
+    """Rebase a manifest pair's alignment path onto whichever root has the file."""
+    for root in roots:
+        path = root / pair.alignment
+        if path.exists():
+            return replace(pair, alignment=str(path.resolve()))
+    raise SystemExit(
+        f"alignment {pair.alignment} not found under {', '.join(map(str, roots))}; "
+        f"pass --alignment-root"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -250,20 +285,22 @@ class AudioSource:
         return target
 
 
-def audio_paths(data_root: Path, split: str) -> dict[str, str]:
+def audio_paths(data_root: Path, alignment_root: Path, split: str) -> dict[str, str]:
     """Track key -> audio path relative to the data root.
 
     From the manifest's tracks.jsonl when there is one (this also covers
     derived splits such as train_w25, whose audio lives under audio/train/),
-    else from the official split's downloaded-songs CSV.
+    else from the files actually present under data_root/audio/{split}/,
+    then the split's downloaded-songs CSV (for tracks still to fetch from S3).
     """
     if (manifest_dir(data_root, split) / "tracks.jsonl").exists():
         return {t.key: t.audio for t in read_tracks(data_root, split)}
-    directory = audio_dir(data_root, split).relative_to(data_root)
-    return {
-        key: (directory / name).as_posix()
-        for key, name in _downloaded_files(data_root, split).items()
-    }
+    directory = Path("audio") / split
+    names = _downloaded_files(data_root, split) or _downloaded_files(alignment_root, split)
+    local = audio_dir(data_root, split)
+    if local.is_dir():
+        names |= {p.stem: p.name for p in local.iterdir() if p.is_file()}
+    return {key: (directory / name).as_posix() for key, name in names.items()}
 
 
 def titles(audio: dict[str, str]) -> dict[str, Track]:
@@ -347,6 +384,9 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path,
                         default=Path(os.environ.get("DATA", DEFAULT_DATA_ROOT)),
                         help="default: $DATA if set, else the repo's data/")
+    parser.add_argument("--alignment-root", type=Path, default=None,
+                        help="folder holding alignments/ (default: --data-root if it "
+                        "has them, else the repo's data/)")
     parser.add_argument("--split", default="train",
                         help="manifest (train_w25, train_w100, ...) or official split")
     parser.add_argument("--n", type=int, default=15, help="pairs to write, one per work")
@@ -367,8 +407,11 @@ def main() -> None:
 
     config = WindowConfig(window_seconds=args.window_seconds)
     rng = random.Random(args.seed)
-    candidates = load_candidates(args.data_root, args.split, args.min_score,
-                                 args.kept_per_song)
+    alignment_root = args.alignment_root or default_alignment_root(
+        args.data_root, args.split
+    )
+    candidates = load_candidates(args.data_root, alignment_root, args.split,
+                                 args.min_score, args.kept_per_song)
     if not candidates:
         raise SystemExit("no positive pairs found")
     chosen = choose(candidates, args.n, rng)
@@ -379,7 +422,7 @@ def main() -> None:
     manifest_tracks = manifest_dir(args.data_root, args.split) / "tracks.jsonl"
     if manifest_tracks.exists():
         durations = {t.key: t.duration for t in read_tracks(args.data_root, args.split)}
-    paths = audio_paths(args.data_root, args.split)
+    paths = audio_paths(args.data_root, alignment_root, args.split)
     for c in chosen:
         for key in (c.key_a, c.key_b):
             # not in any listing: assume the usual layout and let the fetch say
@@ -389,6 +432,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     audio = AudioSource(args.data_root, paths, args.audio_s3, args.out / "audio")
     gap = np.zeros(round(args.gap_seconds * config.sample_rate), dtype=np.float32)
+    alignment_roots = [alignment_root, args.data_root, DEFAULT_DATA_ROOT]
     rows = []
     for i, c in enumerate(chosen, start=1):
         path_a, path_b = audio.path(c.key_a), audio.path(c.key_b)
@@ -399,7 +443,8 @@ def main() -> None:
                 if key not in durations:
                     durations[key] = probe_duration(path)
             anchor_a, anchor_b = rng.choice(
-                pair_anchors(args.data_root, c.pair, durations, config,
+                pair_anchors(Path("/"), resolve_alignment(c.pair, alignment_roots),
+                             durations, config,
                              args.windows_per_pair)
             )
             start_a = quantize(_clamped_start(anchor_a, durations[c.key_a],
