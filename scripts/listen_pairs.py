@@ -34,6 +34,7 @@ Remember `oti` when listening: B may be transposed relative to A (OTI = the
 chroma shift, in semitones, the aligner applied). That is a valid cover.
 
 Examples:
+    python scripts/listen_pairs.py --data-root $DATA --split train_w25
     python scripts/listen_pairs.py --split train --audio-s3 $AUDIO_S3
     python scripts/listen_pairs.py --data-root $DATA --split train --n 15 --seed 1
 """
@@ -44,6 +45,7 @@ import argparse
 import csv
 import html
 import json
+import os
 import random
 import subprocess
 import sys
@@ -114,16 +116,20 @@ def pairs_from_alignments(
 
     downloaded = _downloaded_files(data_root, split)
     pairs = []
+    skipped = {"not downloaded": 0, "missing file": 0, "below --min-score": 0}
     for path in paths:
         song_id, ver_a, ver_b = (int(x) for x in path.stem.split("_"))
         key_a, key_b = f"{song_id}_{ver_a}", f"{song_id}_{ver_b}"
         if downloaded and (key_a not in downloaded or key_b not in downloaded):
+            skipped["not downloaded"] += 1
             continue
         if not path.exists():
+            skipped["missing file"] += 1
             continue
         data = np.load(path)
         score = float(data["score"])
         if score < min_score:
+            skipped["below --min-score"] += 1
             continue
         t_a, t_b = data["t_a"], data["t_b"]
         pairs.append(
@@ -141,6 +147,8 @@ def pairs_from_alignments(
                 n_points=int(len(t_a)),
             )
         )
+    print(f"{len(paths)} alignment files, {len(pairs)} kept; skipped: "
+          + ", ".join(f"{n} {why}" for why, n in skipped.items()))
     return pairs
 
 
@@ -161,7 +169,18 @@ def load_candidates(
         print(f"pairs from {pairs_file}")
         pairs = read_pairs(data_root, split)
     else:
-        print(f"no manifest pairs for {split}; reading {alignment_dir(data_root, split)}")
+        alignments = alignment_dir(data_root, split)
+        print(f"no manifest pairs at {pairs_file}; reading {alignments}")
+        if not alignments.is_dir():
+            manifests = sorted(
+                d.name for d in (data_root / "manifests").glob("*")
+                if (d / "pairs.jsonl").exists()
+            )
+            raise SystemExit(
+                f"{alignments} does not exist. Is --data-root right (it defaults to "
+                f"$DATA, else the repo's data/)? Manifests with pairs under "
+                f"{data_root}: {', '.join(manifests) or 'none'}"
+            )
         pairs = pairs_from_alignments(data_root, split, min_score, kept_per_song)
     return [Candidate(p.song_id, p.key_a, p.key_b, p.score, p.oti, pair=p) for p in pairs]
 
@@ -194,40 +213,68 @@ def _downloaded_files(data_root: Path, split: str) -> dict[str, str]:
 
 
 class AudioSource:
-    """Local audio if present, otherwise a one-off `aws s3 cp` into a cache."""
+    """Local audio if present, otherwise a one-off `aws s3 cp` into a cache.
+
+    `audio` maps track key -> path relative to the data root ("audio/train/
+    10154_10161.webm"), as manifests store it. The S3 object is the same path
+    with the leading "audio/" replaced by --audio-s3.
+    """
 
     def __init__(
-        self, data_root: Path, split: str, audio_s3: str | None, cache: Path
+        self, data_root: Path, audio: dict[str, str], audio_s3: str | None, cache: Path
     ) -> None:
-        self.local = audio_dir(data_root, split)
-        self.split = split
+        self.data_root = data_root
+        self.audio = audio
         self.audio_s3 = audio_s3.rstrip("/") if audio_s3 else None
         self.cache = cache
-        self.names = _downloaded_files(data_root, split)
 
     def path(self, key: str) -> Path:
-        for directory in (self.local, self.cache):
-            found = sorted(directory.glob(f"{key}.*")) if directory.exists() else []
-            if found:
-                return found[0]
+        relative = Path(self.audio[key])
+        for candidate in (self.data_root / relative, self.cache / relative.name):
+            if candidate.exists():
+                return candidate
         if self.audio_s3 is None:
             raise SystemExit(
-                f"no audio for {key} in {self.local}; pass --audio-s3 s3://BUCKET/PREFIX"
+                f"no audio at {self.data_root / relative}; "
+                f"pass --audio-s3 s3://BUCKET/PREFIX"
             )
-        name = self.names.get(key)
-        candidates = [name] if name else [f"{key}.{ext}" for ext in ("webm", "m4a", "mp4")]
         self.cache.mkdir(parents=True, exist_ok=True)
-        for candidate in candidates:
-            target = self.cache / candidate
-            url = f"{self.audio_s3}/{self.split}/{candidate}"
-            result = subprocess.run(
-                ["aws", "s3", "cp", url, str(target), "--only-show-errors"],
-                capture_output=True, text=True,
-            )
-            if result.returncode == 0:
-                return target
-        raise SystemExit(f"could not fetch {key} from {self.audio_s3}/{self.split}/: "
-                         f"{result.stderr.strip()}")
+        target = self.cache / relative.name
+        url = f"{self.audio_s3}/{relative.relative_to('audio').as_posix()}"
+        result = subprocess.run(
+            ["aws", "s3", "cp", url, str(target), "--only-show-errors"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(f"could not fetch {url}: {result.stderr.strip()}")
+        return target
+
+
+def audio_paths(data_root: Path, split: str) -> dict[str, str]:
+    """Track key -> audio path relative to the data root.
+
+    From the manifest's tracks.jsonl when there is one (this also covers
+    derived splits such as train_w25, whose audio lives under audio/train/),
+    else from the official split's downloaded-songs CSV.
+    """
+    if (manifest_dir(data_root, split) / "tracks.jsonl").exists():
+        return {t.key: t.audio for t in read_tracks(data_root, split)}
+    directory = audio_dir(data_root, split).relative_to(data_root)
+    return {
+        key: (directory / name).as_posix()
+        for key, name in _downloaded_files(data_root, split).items()
+    }
+
+
+def titles(audio: dict[str, str]) -> dict[str, Track]:
+    """SHS metadata for the tracks, from each one's official split (optional)."""
+    meta: dict[str, Track] = {}
+    for source in sorted({Path(p).parts[1] for p in audio.values()}):
+        try:
+            meta |= {t.key: t for t in _parse_split(source)}
+        except Exception:  # the SHS CSVs only add titles; never fatal
+            pass
+    return meta
 
 
 def probe_duration(path: Path) -> float:
@@ -297,8 +344,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--split", default="train")
+    parser.add_argument("--data-root", type=Path,
+                        default=Path(os.environ.get("DATA", DEFAULT_DATA_ROOT)),
+                        help="default: $DATA if set, else the repo's data/")
+    parser.add_argument("--split", default="train",
+                        help="manifest (train_w25, train_w100, ...) or official split")
     parser.add_argument("--n", type=int, default=15, help="pairs to write, one per work")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--window-seconds", type=float, default=20.0)
@@ -329,13 +379,15 @@ def main() -> None:
     manifest_tracks = manifest_dir(args.data_root, args.split) / "tracks.jsonl"
     if manifest_tracks.exists():
         durations = {t.key: t.duration for t in read_tracks(args.data_root, args.split)}
-    try:
-        meta: dict[str, Track] = {t.key: t for t in _parse_split(args.split)}
-    except Exception:  # the SHS CSVs are optional here; they only add titles
-        meta = {}
+    paths = audio_paths(args.data_root, args.split)
+    for c in chosen:
+        for key in (c.key_a, c.key_b):
+            # not in any listing: assume the usual layout and let the fetch say
+            paths.setdefault(key, f"audio/{args.split}/{key}.webm")
+    meta = titles({k: paths[k] for c in chosen for k in (c.key_a, c.key_b)})
 
     args.out.mkdir(parents=True, exist_ok=True)
-    audio = AudioSource(args.data_root, args.split, args.audio_s3, args.out / "audio")
+    audio = AudioSource(args.data_root, paths, args.audio_s3, args.out / "audio")
     gap = np.zeros(round(args.gap_seconds * config.sample_rate), dtype=np.float32)
     rows = []
     for i, c in enumerate(chosen, start=1):
