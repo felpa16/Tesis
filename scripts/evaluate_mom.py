@@ -97,8 +97,12 @@ GENERATORS = ("udio", "riffusion", "diffrhythm", "yue")
 GENERATOR_DIRS: dict[str, tuple[str, ...]] = {"diffrhythm": ("diffrhythm", "diffrythm")}
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".webm")
 
-# The three per-window terms stored for every window.
-TERMS = ("style_given_content", "content", "gaussian")
+# The per-window terms stored for every window, by checkpoint kind:
+# train_flow.py's factorized detector, or train_mert_flow.py's MERT-only flow.
+TERMS = {
+    "disentangled": ("style_given_content", "content", "gaussian"),
+    "mert_flow": ("flow", "gaussian"),
+}
 
 # What changing the run would invalidate: scores.jsonl is only reused when
 # these match.
@@ -352,7 +356,12 @@ def prefetch(fn: Callable, items: Iterable, workers: int) -> Iterator:
 
 
 class Scorer:
-    """Frozen MERT + encoder + flows, loaded exactly as train_flow.py builds them."""
+    """Frozen MERT + encoder + flows, loaded exactly as train_flow.py builds them.
+
+    A train_mert_flow.py checkpoint (kind "mert_flow") has no encoder: windows
+    go through MERT, are time-pooled per layer and scored by the MERT-only
+    flow and its Gaussian baseline.
+    """
 
     def __init__(
         self, flow_path: Path, encoder_path: Path | None, device_name: str
@@ -369,6 +378,18 @@ class Scorer:
         self.device = pick_device(device_name)
 
         checkpoint = torch.load(flow_path, map_location=self.device, weights_only=False)
+        self.kind = checkpoint.get("kind", "disentangled")
+        self.terms = TERMS[self.kind]
+        self.epoch = checkpoint.get("epoch")
+        self.step = checkpoint.get("step")
+        self.autocast = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if self.device.type == "cuda"
+            else nullcontext()
+        )
+        if self.kind == "mert_flow":
+            self._init_mert_flow(flow_path, MertExtractor)
+            return
         self.flow_config = config_from_dict(checkpoint["config"])
         stored = checkpoint.get("encoder_checkpoint")
         self.encoder_path = encoder_path or (Path(stored) if stored else None)
@@ -395,17 +416,30 @@ class Scorer:
         self.window_seconds = float(self.flow_config.data.window_seconds)
         self.sample_rate = int(self.encoder_config.mert.sample_rate)
         self.micro_batch = int(self.encoder_config.mert.micro_batch)
-        self.autocast = (
-            torch.autocast("cuda", dtype=torch.bfloat16)
-            if self.device.type == "cuda"
-            else nullcontext()
-        )
-        self.epoch = checkpoint.get("epoch")
-        self.step = checkpoint.get("step")
+
+    def _init_mert_flow(self, flow_path: Path, mert_class) -> None:
+        from train_mert_flow import load_mert_flow
+
+        self.mert_flow, self.flow_config, checkpoint = load_mert_flow(flow_path, self.device)
+        # identity field: what the representation came from (the layer weights' source)
+        self.encoder_path = Path(checkpoint["mix_checkpoint"])
+        self.encoder_config = self.flow_config
+        self.mert = mert_class(self.flow_config.mert).to(self.device)
+        self.window_seconds = float(self.flow_config.data.window_seconds)
+        self.sample_rate = int(self.flow_config.mert.sample_rate)
+        self.micro_batch = int(self.flow_config.mert.micro_batch)
 
     def score(self, waves: list) -> dict[str, list[float]]:
-        """Windows -> the three per-window log-probs, as plain floats."""
+        """Windows -> the per-window log-probs (self.terms), as plain floats."""
         torch = self.torch
+        if self.kind == "mert_flow":
+            from src.models.mert_flow import pool_layers
+
+            with torch.no_grad():
+                batch = torch.stack(waves).to(self.device)
+                pooled = pool_layers(self.mert, batch, self.micro_batch, self.autocast)
+                terms = self.mert_flow.log_probs(pooled)
+            return {t: terms[t].float().cpu().tolist() for t in self.terms}
         with torch.no_grad():
             batch = torch.stack(waves).to(self.device)
             content, style = self.encode_windows(
@@ -474,7 +508,10 @@ def score_run(args: argparse.Namespace) -> None:
         f"windows: {args.windows_per_song} x {window_seconds:g} s per song "
         f"(the flow's training length)"
     )
-    for label, config in (("flow", scorer.flow_config), ("encoder", scorer.encoder_config)):
+    labelled = [("flow", scorer.flow_config)]
+    if scorer.kind != "mert_flow":
+        labelled.append(("encoder", scorer.encoder_config))
+    for label, config in labelled:
         seen = {config.data.train_split, config.data.val_split}
         if args.human_split in seen:
             print(
@@ -490,7 +527,8 @@ def score_run(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "human_split": args.human_split,
     }
-    check_run(args.out_dir, identity, {"alpha": float(scorer.flow_config.flow.alpha)}, args.overwrite)
+    extra = {"alpha": float(scorer.flow_config.flow.alpha), "kind": scorer.kind}
+    check_run(args.out_dir, identity, extra, args.overwrite)
 
     needs_s3 = args.mom_root is None or args.human_audio_key
     s3 = S3(args.bucket, args.region) if needs_s3 else None
@@ -571,7 +609,7 @@ def score_run(args: argparse.Namespace) -> None:
             terms = scorer.score([wave for _, _, wave in batch])
             for i, (slot, start, _) in enumerate(batch):
                 open_songs[slot]["windows"].append(
-                    {"start": start, **{t: terms[t][i] for t in TERMS}}
+                    {"start": start, **{t: terms[t][i] for t in scorer.terms}}
                 )
             n_windows += len(batch)
             for slot in [s for s, r in open_songs.items() if len(r["windows"]) == r["_n"]]:
@@ -626,8 +664,14 @@ def aggregate(values: np.ndarray, method: str, percentile: float) -> float:
     return float(np.percentile(values, percentile))
 
 
-def views(alpha: float) -> dict[str, tuple[str, Callable[[dict], float]]]:
+def views(alpha: float, kind: str = "disentangled") -> dict[str, tuple[str, Callable[[dict], float]]]:
     """Name -> (label, per-window score). 'score' is the one that is plotted."""
+    if kind == "mert_flow":
+        return {
+            "score": ("log p(MERT mix)", lambda w: w["flow"]),
+            "flow": ("log p(MERT mix)", lambda w: w["flow"]),
+            "gaussian": ("full-covariance Gaussian log p(MERT mix)", lambda w: w["gaussian"]),
+        }
     label = "log p(style | content)"
     if alpha:
         label += f" + {alpha:g} · log p(content)"
@@ -686,10 +730,11 @@ def summarize(
     method: str,
     percentile: float,
     fpr: float,
+    kind: str = "disentangled",
 ) -> tuple[dict, dict[str, np.ndarray]]:
     per_view = {
         name: song_scores(records, fn, method, percentile)
-        for name, (_, fn) in views(alpha).items()
+        for name, (_, fn) in views(alpha, kind).items()
     }
     scores = per_view["score"]
     human = scores.get(HUMAN, np.array([]))
@@ -730,7 +775,8 @@ def summarize(
         "alpha": alpha,
         "aggregate": method,
         "percentile": percentile if method == "percentile" else None,
-        "views": {name: label for name, (label, _) in views(alpha).items()},
+        "kind": kind,
+        "views": {name: label for name, (label, _) in views(alpha, kind).items()},
         "threshold": {"human_quantile": fpr, "value": threshold},
         "sources": sources,
         "all_synthetic": {
@@ -756,9 +802,12 @@ def print_summary(summary: dict, order: list[str]) -> None:
         f"threshold = human {fpr:.0%} quantile = {summary['threshold']['value']:.2f} "
         f"(estimated on the same human songs, so 'below' is in-sample)\n"
     )
+    short = {"style_given_content": "s|c", "content": "c", "gaussian": "gauss", "flow": "flow"}
+    columns = [v for v in summary["views"] if v != "score"]
     header = (
-        f"{'source':<12}{'songs':>6}{'median':>11}"
-        f"{'AUROC':>8}{'s|c':>7}{'c':>7}{'gauss':>7}{'below':>8}"
+        f"{'source':<12}{'songs':>6}{'median':>11}{'AUROC':>8}"
+        + "".join(f"{short.get(c, c):>7}" for c in columns)
+        + f"{'below':>8}"
     )
     print(header)
     print("-" * len(header))
@@ -768,14 +817,21 @@ def print_summary(summary: dict, order: list[str]) -> None:
         line += f"{entry['median']:>11.1f}" if "median" in entry else f"{'':>11}"
         if "auroc" in entry:
             a = entry["auroc"]
-            line += (
-                f"{a['score']:>8.3f}{a['style_given_content']:>7.3f}"
-                f"{a['content']:>7.3f}{a['gaussian']:>7.3f}{entry['below_threshold']:>8.1%}"
-            )
+            line += f"{a['score']:>8.3f}" + "".join(f"{a[c]:>7.3f}" for c in columns)
+            line += f"{entry['below_threshold']:>8.1%}"
         print(line)
+    if summary.get("kind") == "mert_flow":
+        legend = (
+            "flow = the MERT-only flow (= score), gauss = the full-covariance "
+            "Gaussian on the same features;"
+        )
+    else:
+        legend = (
+            "s|c = log p(style | content) alone, c = log p(content) alone,\n"
+            "gauss = the conditional-Gaussian baseline;"
+        )
     print(
-        "\nAUROC = P(human scores higher). s|c = log p(style | content) alone, "
-        "c = log p(content) alone,\ngauss = the conditional-Gaussian baseline; "
+        f"\nAUROC = P(human scores higher). {legend}\n"
         f"below = share of songs under the threshold (detected at {fpr:.0%} FPR)."
     )
 
@@ -932,7 +988,10 @@ def report(args: argparse.Namespace) -> None:
         raise SystemExit("no human songs scored: there is nothing to compare against")
     alpha = args.alpha if args.alpha is not None else run.get("alpha", 1.0)
 
-    summary, scores = summarize(records, order, alpha, args.aggregate, args.percentile, args.fpr)
+    kind = run.get("kind", "disentangled")
+    summary, scores = summarize(
+        records, order, alpha, args.aggregate, args.percentile, args.fpr, kind
+    )
     summary["run"] = run
     print_summary(summary, order)
 
@@ -954,7 +1013,8 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--flow-checkpoint", type=Path, required=True,
-                        help="flow_last.pt written by train_flow.py")
+                        help="flow_last.pt written by train_flow.py, or "
+                        "mert_flow_last.pt written by train_mert_flow.py")
     parser.add_argument("--encoder-checkpoint", type=Path,
                         help="default: the one recorded in the flow checkpoint")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT,

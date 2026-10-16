@@ -38,6 +38,14 @@ matplotlib>=3.8           # PCA scatter plots; the script forces the Agg backend
                           # so it runs on a headless instance. PCA itself is a
                           # numpy SVD, so scikit-learn is not a dependency.
 
+# --- MoM benchmark transfer: scripts/fetch_mom.py ---
+huggingface_hub>=0.23      # arrives with transformers anyway, but fetch_mom.py
+                           # uses list_repo_tree/hf_hub_download directly, and
+                           # needs local_dir to download without duplicating
+                           # every blob into the shared cache (>=0.23)
+# hf_transfer             optional; HF_HUB_ENABLE_HF_TRANSFER=1 picks it up for
+#                         multi-connection downloads. Worth it for the 125 GB.
+
 # --- S3 dataset and feature cache: scripts/extract_mert_features.py ---
 boto3>=1.34               # the AWS CLI is a separate install and is not enough:
                           # the extractor lists, gets and puts from worker
