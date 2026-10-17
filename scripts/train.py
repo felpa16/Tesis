@@ -16,7 +16,9 @@ uniform average.
 Validation runs every --val-every steps (default: each epoch end). Each
 validation appends to {checkpoint_dir}/val_metrics.jsonl, together with the
 mean training losses since the previous one, and best.pt keeps the checkpoint
-with the best --select-metric. With --max-steps the run always reaches that
+with the best --select-metric. After every validation the history is redrawn
+as {checkpoint_dir}/loss_curves.png, one train-vs-val panel per loss term
+(scripts/plot_training_curves.py, which can also replot an older run). With --max-steps the run always reaches that
 many steps, taking as many epochs as the training set needs, so runs on
 subsets of different sizes get the same budget.
 
@@ -53,6 +55,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
+from plot_training_curves import plot_run  # noqa: E402
 from shs100k_meta import DEFAULT_DATA_ROOT  # noqa: E402
 from src.config import TrainConfig, load_config  # noqa: E402
 from src.data import (  # noqa: E402
@@ -710,6 +713,7 @@ def main() -> None:
             writer.add_scalar(name, value, global_step)
         with open(checkpoint_dir / "val_metrics.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
+        plot_run(checkpoint_dir)
 
         value = metrics.get(config.select_metric)
         if value is None:

@@ -220,16 +220,37 @@ def default_alignment_root(data_root: Path, split: str) -> Path:
     return data_root
 
 
-def resolve_alignment(pair: PairEntry, roots: list[Path]) -> PairEntry:
-    """Rebase a manifest pair's alignment path onto whichever root has the file."""
-    for root in roots:
-        path = root / pair.alignment
-        if path.exists():
-            return replace(pair, alignment=str(path.resolve()))
-    raise SystemExit(
-        f"alignment {pair.alignment} not found under {', '.join(map(str, roots))}; "
-        f"pass --alignment-root"
-    )
+def with_alignment_files(
+    candidates: list[Candidate], roots: list[Path]
+) -> list[Candidate]:
+    """Candidates whose alignment file exists, rebased to an absolute path.
+
+    Manifest paths are relative to the root they were built against; the file
+    may sit under any of `roots`. Candidates with fixed windows need no file.
+    """
+    roots = list(dict.fromkeys(r.resolve() for r in roots))
+    kept = []
+    for c in candidates:
+        if c.pair is None:
+            kept.append(c)
+            continue
+        for root in roots:
+            path = root / c.pair.alignment
+            if path.exists():
+                kept.append(replace(c, pair=replace(c.pair, alignment=str(path))))
+                break
+    missing = len(candidates) - len(kept)
+    if missing:
+        works = len({c.song_id for c in kept})
+        print(
+            f"warning: {missing} of {len(candidates)} pairs have no alignment file "
+            f"under {', '.join(map(str, roots))}; sampling from the {len(kept)} "
+            f"({works} works) that do. For the full set, extract alignments_k40.tgz "
+            f"into the data root or pass --alignment-root."
+        )
+    if not kept:
+        raise SystemExit("no pair has its alignment file available")
+    return kept
 
 
 # --------------------------------------------------------------------------
@@ -414,6 +435,8 @@ def main() -> None:
                                  args.min_score, args.kept_per_song)
     if not candidates:
         raise SystemExit("no positive pairs found")
+    alignment_roots = [alignment_root, args.data_root, DEFAULT_DATA_ROOT]
+    candidates = with_alignment_files(candidates, alignment_roots)
     chosen = choose(candidates, args.n, rng)
     print(f"{len(candidates)} pairs over {len({c.song_id for c in candidates})} works; "
           f"writing {len(chosen)}")
@@ -432,7 +455,6 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     audio = AudioSource(args.data_root, paths, args.audio_s3, args.out / "audio")
     gap = np.zeros(round(args.gap_seconds * config.sample_rate), dtype=np.float32)
-    alignment_roots = [alignment_root, args.data_root, DEFAULT_DATA_ROOT]
     rows = []
     for i, c in enumerate(chosen, start=1):
         path_a, path_b = audio.path(c.key_a), audio.path(c.key_b)
@@ -443,8 +465,8 @@ def main() -> None:
                 if key not in durations:
                     durations[key] = probe_duration(path)
             anchor_a, anchor_b = rng.choice(
-                pair_anchors(Path("/"), resolve_alignment(c.pair, alignment_roots),
-                             durations, config,
+                # c.pair.alignment is absolute here, so the root is a no-op
+                pair_anchors(Path("/"), c.pair, durations, config,
                              args.windows_per_pair)
             )
             start_a = quantize(_clamped_start(anchor_a, durations[c.key_a],

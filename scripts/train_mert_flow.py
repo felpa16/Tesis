@@ -43,6 +43,21 @@ The loss is the flow's NLL in nats per dimension (plus penalties), so penalty
 weights read on the same scale. Score MoM afterwards with
 scripts/evaluate_mom.py --flow-checkpoint {checkpoint-dir}/mert_flow_last.pt.
 
+Overfitting watch: before training and after every epoch, the flow's NLL is
+measured in eval mode on the val cache and on a fixed random subset of the
+train cache of the same size (--train-eval-windows), so the two numbers are
+directly comparable. Each epoch appends one line to
+{checkpoint-dir}/history.jsonl, and the run ends by drawing
+{checkpoint-dir}/loss_curves.png (scripts/plot_training_curves.py).
+
+--track-metrics also scores human val50 songs against the MoM generators each
+epoch, sampled and windowed as evaluate_mom.py does, and draws
+metric_curves.png. The MERT pass over those songs runs once, before training,
+into --metrics-cache (shared by every run with the same settings); scoring an
+epoch then takes seconds (scripts/track_mom.py). These AUROCs are for watching
+how detection evolves; choosing an epoch by them would select on the
+generators the detector is meant never to see.
+
 Examples:
     python scripts/train_mert_flow.py --frozen-25 \\
         --mix-checkpoint checkpoints/mqa-w100/best.pt \\
@@ -50,6 +65,11 @@ Examples:
     python scripts/train_mert_flow.py --unfrozen-25 \\
         --mix-checkpoint checkpoints/mqa-w100/best.pt \\
         --train-cache cache/pooled/train --val-cache cache/pooled/val50
+    # with per-epoch MoM AUROCs
+    python scripts/train_mert_flow.py --frozen-25 \\
+        --mix-checkpoint checkpoints/mqa-w100/best.pt \\
+        --train-cache cache/pooled/train --val-cache cache/pooled/val50 \\
+        --track-metrics --data-root $DATA --bucket $BUCKET
 """
 
 from __future__ import annotations
@@ -69,6 +89,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
+from plot_training_curves import plot_run  # noqa: E402
 from src.config import TrainConfig, config_from_dict, load_config  # noqa: E402
 from src.data.pooled_cache import PooledCache  # noqa: E402
 from src.models.mert_flow import (  # noqa: E402
@@ -236,6 +257,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-windows", type=int, default=4096,
                         help="held-out windows for empirical diagnostics (should exceed the feature count)")
     parser.add_argument("--val-max-windows", type=int, default=0, help="0 = whole val cache")
+    parser.add_argument("--train-eval-windows", type=int, default=0,
+                        help="fixed train windows scored each epoch for the train/val "
+                        "comparison (0 = as many as val, or 20000 without val)")
     parser.add_argument("--stats-windows", type=int, default=0,
                         help="train windows used for the layer moments (0 = all)")
     parser.add_argument("--refit-stats", action="store_true")
@@ -249,6 +273,26 @@ def parse_args() -> argparse.Namespace:
     unfrozen.add_argument("--entropy-weight", type=float, default=0.01)
     unfrozen.add_argument("--collapse-ratio", type=float, default=0.5)
     unfrozen.add_argument("--stop-on-collapse", action="store_true")
+    tracking = parser.add_argument_group("--track-metrics (per-epoch MoM scoring)")
+    tracking.add_argument("--track-metrics", action="store_true",
+                          help="score human vs. MoM songs after every epoch")
+    tracking.add_argument("--metrics-cache", type=Path,
+                          help="pooled MERT of the evaluation songs, built on first use "
+                          "(default: {train-cache}/../eval-{metrics-human-split})")
+    tracking.add_argument("--metrics-human-split", default="val50")
+    tracking.add_argument("--data-root", type=Path,
+                          help="holds the human manifests and audio (default: the one "
+                          "the train cache was built from)")
+    tracking.add_argument("--bucket", default="songs-and-mert-features")
+    tracking.add_argument("--region", default=None)
+    tracking.add_argument("--mom-prefix", default="mom")
+    tracking.add_argument("--mom-root", type=Path, default=None,
+                          help="read MoM from this local directory instead of S3")
+    tracking.add_argument("--generators", nargs="+", default=None,
+                          help="default: evaluate_mom.py's four")
+    tracking.add_argument("--per-source", type=int, default=300)
+    tracking.add_argument("--windows-per-song", type=int, default=4)
+    tracking.add_argument("--metrics-seed", type=int, default=0, help="song sampling seed")
     return parser.parse_args()
 
 
@@ -260,17 +304,58 @@ def initial_logits(args: argparse.Namespace, streams: tuple[str, ...]) -> dict[s
 
 
 @torch.no_grad()
-def evaluate(model: MertFlow, cache: PooledCache, batch_size: int, max_windows: int, device) -> dict[str, float]:
-    sums = {"val/nll_flow": 0.0, "val/nll_gaussian": 0.0}
-    n = 0
-    for batch in cache.batches(batch_size, rng=None, drop_last=False):
-        if max_windows and n >= max_windows:
-            break
+def evaluate(
+    model: MertFlow, cache: PooledCache, indices: np.ndarray, batch_size: int, device, prefix: str
+) -> dict[str, float]:
+    """Flow and Gaussian NLL (nats per dim) over fixed cache rows, eval mode."""
+    was_training = model.training
+    model.eval()
+    sums = {"nll": 0.0, "nll_gaussian": 0.0}
+    for start in range(0, len(indices), batch_size):
+        batch = cache.gather(indices[start : start + batch_size])
         terms = model.log_probs(torch.from_numpy(batch).to(device))
-        sums["val/nll_flow"] -= float(terms["flow"].sum())
-        sums["val/nll_gaussian"] -= float(terms["gaussian"].sum())
-        n += len(batch)
-    return {k: v / max(n, 1) / model.n_features for k, v in sums.items()}  # nats per dim
+        sums["nll"] -= float(terms["flow"].sum())
+        sums["nll_gaussian"] -= float(terms["gaussian"].sum())
+    model.train(was_training)
+    return {f"{prefix}/{k}": v / max(len(indices), 1) / model.n_features for k, v in sums.items()}
+
+
+def metrics_tracker(args: argparse.Namespace, train: PooledCache, config: TrainConfig, device):
+    """The cached evaluation songs for --track-metrics, built on first use."""
+    import evaluate_mom
+    from track_mom import EvalCache, build_eval_cache, cache_matches
+
+    root = args.metrics_cache or train.root.parent / f"eval-{args.metrics_human_split}"
+    settings = {
+        "human_split": args.metrics_human_split,
+        "per_source": args.per_source,
+        "windows_per_song": args.windows_per_song,
+        "window_seconds": float(train.meta["window_seconds"]),
+        "seed": args.metrics_seed,
+        "generators": list(args.generators or evaluate_mom.GENERATORS),
+        "model_name": train.meta["model_name"],
+    }
+    if not cache_matches(root, settings):
+        build_eval_cache(
+            root,
+            data_root=args.data_root or Path(train.meta["data_root"]),
+            human_split=settings["human_split"],
+            generators=settings["generators"],
+            per_source=settings["per_source"],
+            windows_per_song=settings["windows_per_song"],
+            window_seconds=settings["window_seconds"],
+            seed=settings["seed"],
+            bucket=args.bucket,
+            region=args.region,
+            mom_prefix=args.mom_prefix,
+            mom_root=args.mom_root,
+            mert_config=config.mert,
+            device=device,
+        )
+    cache = EvalCache(root, device)
+    print(f"metrics: {len(cache.rows)} cached windows ({args.metrics_human_split} vs. "
+          f"{', '.join(settings['generators'])}) from {root}")
+    return cache
 
 
 def main() -> None:
@@ -314,6 +399,14 @@ def main() -> None:
         f"arm={arm}  mix={args.mix}  layer_norm={layer_norm}  device={device.type}\n"
         f"train[{train.meta['split']}]: {len(train)} windows   "
         f"val: {f'{len(val)} windows' if val else 'none'}   S={config.data.window_seconds:g}s"
+    )
+
+    tracker = metrics_tracker(args, train, config, device) if args.track_metrics else None
+    if val is not None:
+        val_rows = np.arange(min(args.val_max_windows or len(val), len(val)))
+    n_train_eval = args.train_eval_windows or (len(val_rows) if val is not None else 20000)
+    train_rows = np.sort(
+        np.random.default_rng(config.seed + 1).choice(len(train), min(n_train_eval, len(train)), replace=False)
     )
 
     stats = layer_stats(train, device, args.stats_windows, args.refit_stats)
@@ -395,12 +488,48 @@ def main() -> None:
         )
         return path
 
+    history_path = checkpoint_dir / "history.jsonl"
+    history_path.unlink(missing_ok=True)
+
+    def record_epoch(epoch: int, step: int, running_nll: float | None) -> None:
+        """Train/val NLL (and MoM metrics) of the current model -> history.jsonl."""
+        record: dict = {"epoch": epoch, "step": step}
+        if running_nll is not None:
+            record["train_running/nll"] = running_nll
+        record.update(evaluate(model, train, train_rows, args.batch_size, device, "train"))
+        if val is not None:
+            record.update(evaluate(model, val, val_rows, args.batch_size, device, "val"))
+        if tracker is not None:
+            was_training = model.training
+            model.eval()
+            record.update(tracker.score(model))
+            model.train(was_training)
+        for k, v in record.items():
+            if isinstance(v, float):
+                writer.add_scalar(k, v, step)
+        with open(history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        line = f"  epoch {epoch}: train nll {record['train/nll']:.4f}"
+        if val is not None:
+            line += (f"  val nll {record['val/nll']:.4f}  gap {record['val/nll'] - record['train/nll']:+.4f}"
+                     f"  (gaussian val {record['val/nll_gaussian']:.4f})")
+        line += "  nats/dim"
+        if tracker is not None:
+            line += (f"\n  epoch {epoch}: AUROC all {record['metrics/auroc/all/flow']:.3f} "
+                     f"(gaussian {record['metrics/auroc/all/gaussian']:.3f})  " + "  ".join(
+                         f"{g} {record[f'metrics/auroc/{g}/flow']:.3f}" for g in tracker.order[1:]))
+        print(line, flush=True)
+        if epoch:
+            plot_run(checkpoint_dir)  # redrawn every epoch, so a running job can be checked
+
     collapsed = diagnose(0)
+    record_epoch(0, 0, None)
     step = 0
     rng = np.random.default_rng(config.seed)
     model.train()
     for epoch in range(config.epochs):
         started = time.time()
+        nll_sum, nll_steps = torch.zeros((), device=device), 0
         for batch in train.batches(args.batch_size, rng, drop_last=True):
             x = torch.from_numpy(batch).to(device)
             if trainable:
@@ -425,17 +554,19 @@ def main() -> None:
             optimizer.step()
             scheduler.step()
             step += 1
+            nll_sum += nll.detach()  # summed on the device: no per-step sync
+            nll_steps += 1
 
             if step % config.log_every == 0 or step == 1:
                 print(
-                    f"epoch {epoch} step {step}/{total_steps}  nll/dim={float(nll):.4f}  "
+                    f"epoch {epoch} step {step}/{total_steps}  nll/dim={float(nll.detach()):.4f}  "
                     f"redundancy={float(redundancy):.4f}  kl_uniform={float(entropy):.4f}",
                     flush=True,
                 )
-                writer.add_scalar("train/nll_per_dim", float(nll), step)
+                writer.add_scalar("train/nll_per_dim", float(nll.detach()), step)
                 writer.add_scalar("train/redundancy", float(redundancy), step)
                 writer.add_scalar("train/kl_uniform", float(entropy), step)
-                writer.add_scalar("train/loss", float(loss), step)
+                writer.add_scalar("train/loss", float(loss.detach()), step)
                 writer.add_scalar("train/grad_norm", float(grad_norm), step)
                 writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
             if args.diag_every and step % args.diag_every == 0:
@@ -443,14 +574,8 @@ def main() -> None:
                 if collapsed and args.stop_on_collapse:
                     break
         print(f"epoch {epoch} finished in {time.time() - started:.0f}s")
-        save(epoch + 1, step)
-        if val is not None:
-            model.eval()
-            metrics = evaluate(model, val, args.batch_size, args.val_max_windows, device)
-            model.train()
-            print("  " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()) + "  (nats/dim)")
-            for k, v in metrics.items():
-                writer.add_scalar(k, v, step)
+        save(epoch + 1, step)  # also refreshes the unfrozen arm's standardization
+        record_epoch(epoch + 1, step, float(nll_sum) / max(nll_steps, 1))
         if collapsed and args.stop_on_collapse:
             print("stopping: --stop-on-collapse")
             break
