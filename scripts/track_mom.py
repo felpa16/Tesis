@@ -11,9 +11,13 @@ seconds. The unfrozen arm's changing layer mix is applied at scoring time.
 The human reference is val50 by default, not evaluate_mom.py's test50: these
 numbers are looked at during training, and test50 is scored once per run.
 
+`codec` (src/data/codec.py) re-encodes every window of every source through
+the same chain before MERT; evaluate_mert_probe.py uses it for its codec
+controls. The default, no chain, is evaluate_mom.py's decoding.
+
 Cache layout ({metrics-cache}/):
 
-    meta.json       what was cached: human split, songs per source, K, S, seed
+    meta.json       what was cached: human split, songs per source, K, S, seed, codec
     pooled.npy      (n_windows, 25, 1024) fp16
     windows.jsonl   one {"source", "song", "start"} line per row of pooled.npy
 """
@@ -31,24 +35,26 @@ import torch
 
 import evaluate_mom as em
 from src.config import MertConfig
-from src.data.windows import WindowConfig, decode_window
+from src.data.codec import Chain, chain_name, decode_window_through
+from src.data.windows import WindowConfig
 from src.models import MertExtractor
 from src.models.mert_flow import pool_layers
 
 IDENTITY = ("human_split", "per_source", "windows_per_song", "window_seconds", "seed",
-            "generators", "model_name")
+            "generators", "model_name", "codec")
 
 
-def song_loader(opener: em.AudioOpener, window: WindowConfig, windows_per_song: int):
+def song_loader(opener: em.AudioOpener, window: WindowConfig, windows_per_song: int, codec: Chain = ()):
     """song -> em.Loaded with its K windows, cut exactly as evaluate_mom.py cuts
-    them. A song that cannot be fetched or decoded comes back with .error set."""
+    them (after re-encoding through `codec`, if any). A song that cannot be
+    fetched or decoded comes back with .error set."""
 
     def load(song: em.Song) -> em.Loaded:
         try:
             with opener.open(song) as path:
                 duration = song.duration if song.duration is not None else em.probe_duration(path)
                 starts = em.window_starts(duration, window.window_seconds, windows_per_song)
-                waves = [decode_window(path, start, window) for start in starts]
+                waves = [decode_window_through(path, start, window, codec) for start in starts]
             return em.Loaded(song, duration, starts, waves)
         except Exception as exc:  # noqa: BLE001 - reported, the song is left out
             return em.Loaded(song, None, [], [], f"{type(exc).__name__}: {exc}")
@@ -74,6 +80,7 @@ def build_eval_cache(
     device: torch.device,
     batch: int = 16,
     fetch_workers: int = 8,
+    codec: Chain = (),
 ) -> None:
     from src.s3 import S3
 
@@ -85,6 +92,7 @@ def build_eval_cache(
         "seed": seed,
         "generators": list(generators),
         "model_name": mert_config.model_name,
+        "codec": chain_name(codec),
         "data_root": str(data_root),
     }
     s3 = S3(bucket, region) if mom_root is None else None
@@ -106,10 +114,10 @@ def build_eval_cache(
         )
     todo = em.interleave(groups)
     print(f"metrics cache: {len(todo)} songs ({', '.join(f'{len(g)}' for g in groups)} "
-          f"for {human_split}, {', '.join(generators)}) -> {out_dir}")
+          f"for {human_split}, {', '.join(generators)}), codec {chain_name(codec) or 'none'} -> {out_dir}")
 
     window = WindowConfig(window_seconds=window_seconds, sample_rate=mert_config.sample_rate)
-    load = song_loader(opener, window, windows_per_song)
+    load = song_loader(opener, window, windows_per_song, codec)
     mert = MertExtractor(mert_config).to(device)
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
     pooled: list[np.ndarray] = []
@@ -166,7 +174,7 @@ def cache_matches(out_dir: Path, settings: dict) -> bool:
     if not (meta_path.exists() and (out_dir / "pooled.npy").exists()):
         return False
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    changed = [k for k in IDENTITY if meta.get(k) != settings[k]]
+    changed = [k for k in IDENTITY if meta.get(k) != settings.get(k)]  # no "codec" = none
     if changed:
         raise SystemExit(f"{out_dir} was cached with different {', '.join(changed)}; "
                          "pass another --metrics-cache")

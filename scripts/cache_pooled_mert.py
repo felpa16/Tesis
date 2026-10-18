@@ -13,12 +13,21 @@ this one cache.
 
 Track order is shuffled with --seed before sharding, so a partial cache (or
 --max-tracks) is a random sample rather than the first works of the manifest.
+
+--codec re-encodes every window through a codec chain before MERT
+(src/data/codec.py). Only the supervised probe needs it (train_mert_probe.py,
+experiments.md section 13): with the same chain on the MoM cache, both classes
+reach MERT with the same last codec. A probe needs a few thousand human tracks,
+not the whole split, so pair it with --max-tracks.
 Resumable: finished shards are skipped, and the run refuses to extend a cache
 built with different settings.
 
 Examples:
     python scripts/cache_pooled_mert.py --split train --out-dir cache/pooled/train --data-root $DATA
     python scripts/cache_pooled_mert.py --split val50 --out-dir cache/pooled/val50 --data-root $DATA
+    # human side of the probe's common-codec arm
+    python scripts/cache_pooled_mert.py --split train --max-tracks 8000 --codec mp3:64k \
+        --out-dir cache/pooled/train-mp3-64k --data-root $DATA
     # local smoke run
     python scripts/cache_pooled_mert.py --split val --out-dir /tmp/pc --max-tracks 2 \\
         --windows-per-track 1 --window-seconds 5 --device cpu --num-workers 0
@@ -45,25 +54,27 @@ sys.path.insert(0, str(SCRIPTS_DIR.parent))
 from evaluate_mom import window_starts  # noqa: E402
 from shs100k_meta import DEFAULT_DATA_ROOT  # noqa: E402
 from src.config import MertConfig  # noqa: E402
+from src.data.codec import Chain, chain_name, check_encoders, decode_window_through, parse_chain  # noqa: E402
 from src.data.manifest import read_tracks  # noqa: E402
 from src.data.pooled_cache import shard_done, write_shard  # noqa: E402
-from src.data.windows import WindowConfig, decode_window  # noqa: E402
+from src.data.windows import WindowConfig  # noqa: E402
 from src.models.mert import MertExtractor  # noqa: E402
 from src.models.mert_flow import pool_layers  # noqa: E402
 from src.training import pick_device  # noqa: E402
 
 # Settings a cache is extended under only if they match.
 IDENTITY = ("split", "window_seconds", "windows_per_track", "max_tracks", "seed",
-            "model_name", "shard_size")
+            "model_name", "shard_size", "codec")
 
 
 class WindowList(Dataset):
     """(audio path, start) -> decoded window; failures come back flagged."""
 
-    def __init__(self, items: list[dict], data_root: Path, config: WindowConfig) -> None:
+    def __init__(self, items: list[dict], data_root: Path, config: WindowConfig, codec: Chain = ()) -> None:
         self.items = items
         self.data_root = data_root
         self.config = config
+        self.codec = codec
 
     def __len__(self) -> int:
         return len(self.items)
@@ -72,7 +83,7 @@ class WindowList(Dataset):
         item = self.items[index]
         path = self.data_root / item["audio"]
         try:
-            wave = decode_window(path, item["start"], self.config)
+            wave = decode_window_through(path, item["start"], self.config, self.codec)
             ok, error = True, ""
         except Exception as exc:  # noqa: BLE001 - one unreadable file must not stop a 4-hour run
             wave = torch.zeros(self.config.window_samples)
@@ -104,6 +115,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-seconds", type=float, default=20.0)
     parser.add_argument("--windows-per-track", type=int, default=4)
     parser.add_argument("--max-tracks", type=int, default=0, help="0 = every track")
+    parser.add_argument("--codec", default=None,
+                        help="codec chain applied to every window before MERT, e.g. mp3:64k "
+                             "(src/data/codec.py; default: none)")
     parser.add_argument("--seed", type=int, default=0, help="track-order shuffle")
     parser.add_argument("--shard-size", type=int, default=4096, help="windows per shard")
     parser.add_argument("--batch", type=int, default=8, help="windows per MERT call")
@@ -117,6 +131,8 @@ def main() -> None:
     args = parse_args()
     mert_config = MertConfig(micro_batch=args.mert_micro_batch)
     window = WindowConfig(window_seconds=args.window_seconds, sample_rate=mert_config.sample_rate)
+    codec = parse_chain(args.codec)
+    check_encoders(codec)
 
     items = plan_windows(
         read_tracks(args.data_root, args.split), args.window_seconds,
@@ -131,6 +147,7 @@ def main() -> None:
         "seed": args.seed,
         "model_name": mert_config.model_name,
         "shard_size": args.shard_size,
+        "codec": chain_name(codec),
         "sample_rate": mert_config.sample_rate,
         "n_hidden_states": mert_config.n_hidden_states,
         "dim": mert_config.dim,
@@ -154,7 +171,8 @@ def main() -> None:
     todo = [i for i in range(n_shards) if not shard_done(args.out_dir, i)]
     print(
         f"{args.split}: {meta['n_tracks']} tracks, {len(items)} windows of "
-        f"{args.window_seconds:g} s, {n_shards} shards, {len(todo)} to do -> {args.out_dir}"
+        f"{args.window_seconds:g} s, {n_shards} shards, {len(todo)} to do, "
+        f"codec {chain_name(codec) or 'none'} -> {args.out_dir}"
     )
     if not todo:
         return
@@ -168,7 +186,7 @@ def main() -> None:
     for shard in todo:
         chunk = items[shard * args.shard_size : (shard + 1) * args.shard_size]
         loader = DataLoader(
-            WindowList(chunk, args.data_root, window),
+            WindowList(chunk, args.data_root, window, codec),
             batch_size=args.batch, num_workers=args.num_workers,
         )
         pooled, rows = [], []

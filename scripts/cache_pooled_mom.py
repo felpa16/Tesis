@@ -17,14 +17,20 @@ evaluate_mert_probe.py score at --per-source up to --skip. The next
 as long as evaluation keeps --per-source <= --skip and the same seed;
 evaluate_mert_probe.py also drops any overlap it finds.
 
-Every generator is cached, the one a probe will leave out included, so one
-cache serves every --leave-out. Generators are interleaved song by song, so a
-partial cache is balanced across them.
+Every generator is cached, so one cache serves every probe
+(train_mert_probe.py --train-generators). Generators are interleaved song by
+song, so a partial cache is balanced across them.
+
+--codec re-encodes every window through a codec chain before MERT
+(src/data/codec.py). It is the probe's protection against learning each
+generator's mp3 settings: build the human caches with the same --codec
+(cache_pooled_mert.py), and train_mert_probe.py refuses caches that disagree.
 
 Rows: {"key": "{generator}/{song}", "source": generator, "song": song, "start": s}
 
 Examples:
     python scripts/cache_pooled_mom.py --out-dir $CACHE/mom --bucket $BUCKET
+    python scripts/cache_pooled_mom.py --out-dir $CACHE/mom-mp3-64k --bucket $BUCKET --codec mp3:64k
     # local smoke run
     python scripts/cache_pooled_mom.py --out-dir /tmp/pm --mom-root ~/mom \\
         --per-generator 2 --windows-per-song 1 --window-seconds 5 --device cpu
@@ -49,6 +55,7 @@ sys.path.insert(0, str(SCRIPTS_DIR.parent))
 import evaluate_mom as em  # noqa: E402
 from track_mom import song_loader  # noqa: E402
 from src.config import MertConfig  # noqa: E402
+from src.data.codec import chain_name, check_encoders, parse_chain  # noqa: E402
 from src.data.pooled_cache import shard_done, write_shard  # noqa: E402
 from src.data.windows import WindowConfig  # noqa: E402
 from src.models import MertExtractor  # noqa: E402
@@ -57,7 +64,7 @@ from src.training import pick_device  # noqa: E402
 
 # Settings a cache is extended under only if they match.
 IDENTITY = ("generators", "per_generator", "skip", "seed", "window_seconds",
-            "windows_per_song", "model_name", "songs_per_shard")
+            "windows_per_song", "model_name", "songs_per_shard", "codec")
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +80,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0, help="must match evaluate_mom.py's --seed")
     parser.add_argument("--window-seconds", type=float, default=20.0)
     parser.add_argument("--windows-per-song", type=int, default=4)
+    parser.add_argument("--codec", default=None,
+                        help="codec chain applied to every window before MERT, e.g. mp3:64k "
+                             "(src/data/codec.py; default: none)")
     parser.add_argument("--songs-per-shard", type=int, default=1024)
     parser.add_argument("--bucket", default="songs-and-mert-features")
     parser.add_argument("--region", default=None)
@@ -92,6 +102,8 @@ def main() -> None:
     args = parse_args()
     mert_config = MertConfig(micro_batch=args.mert_micro_batch)
     window = WindowConfig(window_seconds=args.window_seconds, sample_rate=mert_config.sample_rate)
+    codec = parse_chain(args.codec)
+    check_encoders(codec)
 
     s3 = None
     if args.mom_root is None:
@@ -122,6 +134,7 @@ def main() -> None:
         "windows_per_song": args.windows_per_song,
         "model_name": mert_config.model_name,
         "songs_per_shard": args.songs_per_shard,
+        "codec": chain_name(codec),
         "sample_rate": mert_config.sample_rate,
         "n_hidden_states": mert_config.n_hidden_states,
         "dim": mert_config.dim,
@@ -144,7 +157,8 @@ def main() -> None:
     meta_path.write_text(json.dumps(meta, indent=1) + "\n", encoding="utf-8")
 
     todo = [i for i in range(n_shards) if not shard_done(args.out_dir, i)]
-    print(f"{len(todo_songs)} songs in {n_shards} shards, {len(todo)} to do -> {args.out_dir}")
+    print(f"{len(todo_songs)} songs in {n_shards} shards, {len(todo)} to do, "
+          f"codec {chain_name(codec) or 'none'} -> {args.out_dir}")
     if not todo:
         return
 
@@ -152,7 +166,7 @@ def main() -> None:
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
     mert = MertExtractor(mert_config).to(device)
     opener = em.AudioOpener(Path("."), s3, None, args.mom_root is not None, args.tmp_dir)
-    load = song_loader(opener, window, args.windows_per_song)
+    load = song_loader(opener, window, args.windows_per_song, codec)
     started, n_windows, failures = time.time(), 0, []
 
     for shard in todo:
