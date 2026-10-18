@@ -39,6 +39,23 @@ IDENTITY = ("human_split", "per_source", "windows_per_song", "window_seconds", "
             "generators", "model_name")
 
 
+def song_loader(opener: em.AudioOpener, window: WindowConfig, windows_per_song: int):
+    """song -> em.Loaded with its K windows, cut exactly as evaluate_mom.py cuts
+    them. A song that cannot be fetched or decoded comes back with .error set."""
+
+    def load(song: em.Song) -> em.Loaded:
+        try:
+            with opener.open(song) as path:
+                duration = song.duration if song.duration is not None else em.probe_duration(path)
+                starts = em.window_starts(duration, window.window_seconds, windows_per_song)
+                waves = [decode_window(path, start, window) for start in starts]
+            return em.Loaded(song, duration, starts, waves)
+        except Exception as exc:  # noqa: BLE001 - reported, the song is left out
+            return em.Loaded(song, None, [], [], f"{type(exc).__name__}: {exc}")
+
+    return load
+
+
 def build_eval_cache(
     out_dir: Path,
     *,
@@ -92,17 +109,7 @@ def build_eval_cache(
           f"for {human_split}, {', '.join(generators)}) -> {out_dir}")
 
     window = WindowConfig(window_seconds=window_seconds, sample_rate=mert_config.sample_rate)
-
-    def load(song: em.Song) -> em.Loaded:
-        try:
-            with opener.open(song) as path:
-                duration = song.duration if song.duration is not None else em.probe_duration(path)
-                starts = em.window_starts(duration, window_seconds, windows_per_song)
-                waves = [decode_window(path, start, window) for start in starts]
-            return em.Loaded(song, duration, starts, waves)
-        except Exception as exc:  # noqa: BLE001 - reported, the song is left out
-            return em.Loaded(song, None, [], [], f"{type(exc).__name__}: {exc}")
-
+    load = song_loader(opener, window, windows_per_song)
     mert = MertExtractor(mert_config).to(device)
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
     pooled: list[np.ndarray] = []

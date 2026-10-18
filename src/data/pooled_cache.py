@@ -55,9 +55,8 @@ class PooledCache:
             raise SystemExit(f"{self.root}: no meta.json, not a pooled-MERT cache")
         self.meta = json.loads(meta.read_text(encoding="utf-8"))
         npys = sorted(self.root.glob("shard_*.npy"))
-        self.arrays = [
-            np.load(p, mmap_mode="r") for p in npys if p.with_suffix(".jsonl").exists()
-        ]
+        self.paths = [p for p in npys if p.with_suffix(".jsonl").exists()]
+        self.arrays = [np.load(p, mmap_mode="r") for p in self.paths]
         if not self.arrays:
             raise SystemExit(f"{self.root}: no complete shards")
         self.offsets = np.cumsum([0] + [len(a) for a in self.arrays])
@@ -65,6 +64,17 @@ class PooledCache:
 
     def __len__(self) -> int:
         return int(self.offsets[-1])
+
+    def rows(self) -> list[dict]:
+        """Every row's .jsonl record, in the global order gather() indexes."""
+        out: list[dict] = []
+        for path, array in zip(self.paths, self.arrays):
+            with open(path.with_suffix(".jsonl"), encoding="utf-8") as f:
+                lines = [json.loads(line) for line in f if line.strip()]
+            if len(lines) != len(array):
+                raise SystemExit(f"{path}: {len(array)} rows but {len(lines)} index lines")
+            out.extend(lines)
+        return out
 
     def gather(self, indices: np.ndarray) -> np.ndarray:
         """Rows at global `indices` (any order) -> (n, L, D) float32, same order."""
