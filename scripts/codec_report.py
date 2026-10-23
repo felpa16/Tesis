@@ -165,11 +165,13 @@ def main() -> None:
             print(f"  {source:<11} {spec}")
     if medians:
         lowest = min(medians.values())
-        below = [b for b in MP3_LADDER if b < lowest]
-        pick = below[-1] if below else MP3_LADDER[0]
-        print(f"\nlowest median bitrate: {lowest:.0f} kbps ({min(medians, key=medians.get)}). A common "
-              f"--codec below it, e.g. mp3:{pick}k, sets the artifacts both classes share; lower masks "
-              "the original codecs more and the music more too.")
+        # about half the lowest median, so the new quantization swamps every source's
+        # original artifacts; never below 48k, where it erases the music too
+        below = [b for b in MP3_LADDER if 48 <= b <= lowest / 2]
+        pick = below[-1] if below else 48
+        print(f"\nlowest median bitrate: {lowest:.0f} kbps ({min(medians, key=medians.get)}). Suggested "
+              f"common --codec: mp3:{pick}k (about half of it). Just below the lowest median is not "
+              "enough: a lightly re-encoded mp3 keeps its original artifacts.")
     if args.out:
         args.out.write_text(json.dumps(records, indent=1) + "\n", encoding="utf-8")
         print(f"-> {args.out}")
