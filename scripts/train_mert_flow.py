@@ -41,7 +41,16 @@ fits the training-set moments of all 25 layers jointly and stores them as
 
 The loss is the flow's NLL in nats per dimension (plus penalties), so penalty
 weights read on the same scale. Score MoM afterwards with
-scripts/evaluate_mom.py --flow-checkpoint {checkpoint-dir}/mert_flow_last.pt.
+scripts/evaluate_mom.py --flow-checkpoint {checkpoint-dir}/mert_flow_last.pt,
+or with scripts/evaluate_mert_flow.py for the codec controls.
+
+Codec. A train cache built with cache_pooled_mert.py --codec CHAIN trains the
+flow on human audio re-encoded through CHAIN; the val cache must use the same
+chain. The chain is recorded in the checkpoint, the default checkpoint dir gets
+it as a suffix, --track-metrics scores its evaluation songs through it, and
+scripts/evaluate_mert_flow.py scores test50 through it. Human training audio
+and both classes at evaluation then share the last codec (experiments.md
+section 15).
 
 Overfitting watch: before training and after every epoch, the flow's NLL is
 measured in eval mode on the val cache and on a fixed random subset of the
@@ -91,6 +100,7 @@ sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
 from plot_training_curves import plot_run  # noqa: E402
 from src.config import TrainConfig, config_from_dict, load_config  # noqa: E402
+from src.data.codec import chain_slug, parse_chain  # noqa: E402
 from src.data.pooled_cache import PooledCache  # noqa: E402
 from src.models.mert_flow import (  # noqa: E402
     STREAMS,
@@ -325,7 +335,9 @@ def metrics_tracker(args: argparse.Namespace, train: PooledCache, config: TrainC
     import evaluate_mom
     from track_mom import EvalCache, build_eval_cache, cache_matches
 
-    root = args.metrics_cache or train.root.parent / f"eval-{args.metrics_human_split}"
+    chain = parse_chain(train.meta.get("codec"))  # the evaluation songs go through the training chain
+    root = args.metrics_cache or train.root.parent / (
+        f"eval-{args.metrics_human_split}" + (f"-{chain_slug(chain)}" if chain else ""))
     settings = {
         "human_split": args.metrics_human_split,
         "per_source": args.per_source,
@@ -334,6 +346,7 @@ def metrics_tracker(args: argparse.Namespace, train: PooledCache, config: TrainC
         "seed": args.metrics_seed,
         "generators": list(args.generators or evaluate_mom.GENERATORS),
         "model_name": train.meta["model_name"],
+        "codec": train.meta.get("codec"),
     }
     if not cache_matches(root, settings):
         build_eval_cache(
@@ -351,6 +364,7 @@ def metrics_tracker(args: argparse.Namespace, train: PooledCache, config: TrainC
             mom_root=args.mom_root,
             mert_config=config.mert,
             device=device,
+            codec=chain,
         )
     cache = EvalCache(root, device)
     print(f"metrics: {len(cache.rows)} cached windows ({args.metrics_human_split} vs. "
@@ -383,22 +397,25 @@ def main() -> None:
     train = PooledCache(args.train_cache)
     val = PooledCache(args.val_cache) if args.val_cache else None
     for cache in [c for c in (val,) if c is not None]:
-        for key in ("window_seconds", "model_name"):
-            if cache.meta[key] != train.meta[key]:
+        for key in ("window_seconds", "model_name", "codec"):  # no "codec" = original audio
+            if cache.meta.get(key) != train.meta.get(key):
                 raise SystemExit(f"{cache.root} and {train.root} differ in {key}")
+    codec = train.meta.get("codec")
     if train.meta["model_name"] != config.mert.model_name:
         raise SystemExit(f"cache was built with {train.meta['model_name']}, config says {config.mert.model_name}")
     config.data.window_seconds = float(train.meta["window_seconds"])  # what evaluate_mom will cut
     config.data.train_split = train.meta["split"]
     config.data.val_split = val.meta["split"] if val else "none"
 
-    checkpoint_dir = args.checkpoint_dir or Path(config.checkpoint_dir) / f"mert-flow-{arm}"
-    log_dir = args.log_dir or Path(config.log_dir) / time.strftime(f"mert-flow-{arm}-%Y%m%d-%H%M%S")
+    run = f"mert-flow-{arm}" + (f"-{chain_slug(parse_chain(codec))}" if codec else "")
+    checkpoint_dir = args.checkpoint_dir or Path(config.checkpoint_dir) / run
+    log_dir = args.log_dir or Path(config.log_dir) / time.strftime(f"{run}-%Y%m%d-%H%M%S")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     print(
         f"arm={arm}  mix={args.mix}  layer_norm={layer_norm}  device={device.type}\n"
         f"train[{train.meta['split']}]: {len(train)} windows   "
-        f"val: {f'{len(val)} windows' if val else 'none'}   S={config.data.window_seconds:g}s"
+        f"val: {f'{len(val)} windows' if val else 'none'}   S={config.data.window_seconds:g}s   "
+        f"codec {codec or 'none (original audio)'}"
     )
 
     tracker = metrics_tracker(args, train, config, device) if args.track_metrics else None
@@ -480,6 +497,7 @@ def main() -> None:
                 "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                 "mix_checkpoint": str(args.mix_checkpoint),
                 "train_cache": str(args.train_cache),
+                "codec": codec,
                 "init_weights": {s: w.tolist() for s, w in init_weights.items()},
                 "epoch": epoch,
                 "step": step,

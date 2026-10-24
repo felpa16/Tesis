@@ -421,6 +421,10 @@ class Scorer:
         from train_mert_flow import load_mert_flow
 
         self.mert_flow, self.flow_config, checkpoint = load_mert_flow(flow_path, self.device)
+        if checkpoint.get("codec"):
+            print(f"warning: {flow_path} was trained on audio through {checkpoint['codec']}, but "
+                  "this script scores original audio; scripts/evaluate_mert_flow.py scores it "
+                  "through its own chain")
         # identity field: what the representation came from (the layer weights' source)
         self.encoder_path = Path(checkpoint["mix_checkpoint"])
         self.encoder_config = self.flow_config

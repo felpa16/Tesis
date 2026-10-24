@@ -15,10 +15,16 @@ Track order is shuffled with --seed before sharding, so a partial cache (or
 --max-tracks) is a random sample rather than the first works of the manifest.
 
 --codec re-encodes every window through a codec chain before MERT
-(src/data/codec.py). Only the supervised probe needs it (train_mert_probe.py,
-experiments.md section 13): with the same chain on the MoM cache, both classes
-reach MERT with the same last codec. A probe needs a few thousand human tracks,
-not the whole split, so pair it with --max-tracks.
+(src/data/codec.py). Two users:
+  * the supervised probe (train_mert_probe.py, experiments.md section 13): with
+    the same chain on the MoM cache, both classes reach MERT with the same last
+    codec. A probe needs a few thousand human tracks, not the whole split, so
+    pair it with --max-tracks;
+  * the flow's codec-matched arm (train_mert_flow.py, evaluate_mert_flow.py,
+    section 15): a flow trained on human audio through the chain that both
+    classes go through at evaluation. Compare it with a flow trained on the
+    same tracks as original audio: the same --max-tracks and --seed without
+    --codec select the same tracks.
 Resumable: finished shards are skipped, and the run refuses to extend a cache
 built with different settings.
 
