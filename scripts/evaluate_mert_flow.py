@@ -112,7 +112,9 @@ def parse_args() -> argparse.Namespace:
                         help="train_mert_flow.py checkpoints (mert_flow_last.pt)")
     parser.add_argument("--codec", nargs="+", default=["mp3:64k"],
                         help="common chains, each applied to both classes as one condition "
-                             "(default: mp3:64k, section 13's chain; 'none' = original audio)")
+                             "(default: mp3:64k, section 13's chain; 'none' = original audio). "
+                             "Each flow's training chain is always scored as well, so 'none' "
+                             "adds no condition for an original-audio flow")
     parser.add_argument("--codec-check", nargs="*", default=[],
                         help="chains applied before each condition's chain to the same songs, "
                              "e.g. mp3:128k:44100:2 opus:137k:48000:2")
