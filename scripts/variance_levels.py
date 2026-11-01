@@ -44,7 +44,8 @@ deviation from its recording's mean, and the share of the within-recording
 variance the slot explains.
 
 Input. A train_mert_flow.py checkpoint and a pooled-MERT cache of one human
-split (cache_pooled_mert.py layout), whose manifest gives the works. The
+split (cache_pooled_mert.py layout). The work is read off the track key,
+{work}_{version}, as build_manifest.py does, so no manifest is needed. The
 default is the checkpoint's --val-cache: val50, held out, every track of the
 split. The training cache (--cache $CACHE/train) gives ~20× the works but is
 in-sample: the Gaussian and the flow were fitted on those windows. Nothing
@@ -81,7 +82,6 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
 import dilution_diagnostic as dd  # noqa: E402
-import evaluate_mert_probe as emp  # noqa: E402
 from src.data.codec import chain_name, chain_slug, parse_chain  # noqa: E402
 from src.data.pooled_cache import PooledCache  # noqa: E402
 from src.training import pick_device  # noqa: E402
@@ -97,9 +97,6 @@ def parse_args() -> argparse.Namespace:
                         help="train_mert_flow.py checkpoint (mert_flow_last.pt)")
     parser.add_argument("--cache", type=Path, default=None,
                         help="pooled-MERT cache of one human split (default: the checkpoint's --val-cache)")
-    parser.add_argument("--data-root", type=Path, default=None,
-                        help="holds the split's manifest, which gives the works "
-                             "(default: the cache's data_root)")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--bootstrap", type=int, default=1000, help="resamples of the works")
     parser.add_argument("--seed", type=int, default=0, help="bootstrap seed")
@@ -235,17 +232,10 @@ def main() -> None:
         print("note: this is the flow's training cache. The Gaussian and the flow were fitted on these "
               "windows, so the variance is in-sample")
 
-    data_root = args.data_root or Path(meta.get("data_root", "."))
-    works = emp.work_of(data_root, split)
-    if works is None:
-        raise SystemExit(f"no {split} manifest under {data_root}; the work level needs it (pass --data-root)")
     rows = cache.rows()
     keys = np.array([row["key"] for row in rows], dtype=str)
     rec_keys, rec = np.unique(keys, return_inverse=True)
-    unknown = [k for k in rec_keys if k not in works]
-    if unknown:
-        raise SystemExit(f"{len(unknown)} cached tracks are not in the {split} manifest, e.g. {unknown[0]}")
-    _, work_of_rec = np.unique(np.array([str(works[k]) for k in rec_keys]), return_inverse=True)
+    _, work_of_rec = np.unique(np.array([k.split("_")[0] for k in rec_keys]), return_inverse=True)
     n_rec, n_work = len(rec_keys), int(work_of_rec.max()) + 1
     rec_per_work = np.bincount(work_of_rec, minlength=n_work)
     win_per_rec = np.bincount(rec, minlength=n_rec)
