@@ -38,10 +38,11 @@ that is ~0 can come out slightly negative. Intervals: works resampled with
 replacement, pairs of two copies of one work left out, the same resamples for
 every statistic.
 
-Window position. The windows sit in K equal slices of the track, so an intro
-always falls in slot 1. Over recordings with all K windows: each slot's mean
-deviation from its recording's mean, and the share of the within-recording
-variance the slot explains.
+Window position. Each window is centred in one of K equal slices of the track,
+never at second 0 or flush with the end (evaluate_mom.window_starts), so slot 1
+is the early body of the track, not its intro. Over recordings with all K
+windows: each slot's mean deviation from its recording's mean, and the share
+of the within-recording variance the slot explains.
 
 Input. A train_mert_flow.py checkpoint and a pooled-MERT cache of one human
 split (cache_pooled_mert.py layout). The work is read off the track key,
