@@ -371,8 +371,12 @@ def main() -> None:
     eval_root = args.eval_cache or train_root.parent / (
         f"eval-{args.human_split}" + (f"-{chain_slug(trained)}" if trained else ""))
     if not (eval_root / "pooled.npy").exists():
-        raise SystemExit(f"no evaluation cache at {eval_root}. Build it with scripts/evaluate_mert_flow.py "
-                         f"--human-split {args.human_split}, or pass --eval-cache")
+        raise SystemExit(
+            f"no evaluation cache at {eval_root}. Pass --eval-cache, or build it (the sampled "
+            f"{args.human_split} tracks must be under --data-root; experiments.md section 20):\n"
+            f"  python scripts/evaluate_mert_flow.py --checkpoints {args.checkpoint} "
+            f"--human-split {args.human_split} --codec none --eval-dir {eval_root.parent} "
+            "--data-root $DATA --bucket $BUCKET")
     cache = tm.EvalCache(eval_root, device)
     meta = cache.meta
     if meta["model_name"] != config.mert.model_name or \
