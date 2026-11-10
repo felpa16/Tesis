@@ -33,6 +33,18 @@ What.
      human FPR. Δ against "none" comes with a paired bootstrap 95 % interval:
      human songs resampled by work, generator songs by song, the same
      resamples for every threshold.
+  4. The author's operating point (section 20, second follow-up). The
+     untrimmed refit's threshold at --fpr human FPR is kept as a fixed log
+     density and applied to every refit. For this, log p is taken of the mix
+     itself rather than of the standardized features, so that one value means
+     the same density in every refit. Reported per refit:
+       * the human FPR and the synthetic TPR it reaches at that threshold;
+       * the untrimmed refit's TPR at that same FPR. A trim that only moves
+         along the untrimmed ROC curve gives the same number;
+       * the held-out human songs it newly flags, by key. Titles and links
+         are in listen_tails.py's recordings.csv.
+     The untrimmed refit's own curve (TPR at 5, 10, 20 and 30 % FPR) is
+     printed too. That is the same trade made without any trim.
 
 Prediction (section 20, written before the run). Under section 16's scale
 model w = τ g, with g spherically symmetric and independent of τ, trimming on
@@ -54,6 +66,9 @@ what says whether it does:
   >t       share of held-out human windows (window level) or songs (recording
            level) above the same cut-off: the trim does not remove these, and
            they are where the false positives come from
+Under the same model, the operating point of item 4 lies on the untrimmed
+curve: the refit's TPR at the fixed threshold equals the untrimmed TPR at the
+FPR it reaches.
 
 Selection. A threshold chosen by looking at the AUROC is fitted to these
 generators. Choose it on the --dev generators (default riffusion and
@@ -102,6 +117,7 @@ from src.training import pick_device  # noqa: E402
 LEVELS = ("window", "recording")
 DEV = ("riffusion", "diffrhythm")
 QUANTILES = (0.5, 0.9, 0.95, 0.99, 0.999)
+CURVE = (0.05, 0.10, 0.20, 0.30)  # human FPRs for the untrimmed refit's operating curve
 CHUNK = 8192  # rows per matrix product over the training features
 
 
@@ -124,6 +140,8 @@ def parse_args() -> argparse.Namespace:
                         help="trim single windows, or whole recordings by their geometric-mean τ²")
     parser.add_argument("--dev", nargs="+", default=list(DEV),
                         help="generators a threshold may be chosen on; the others are read untouched")
+    parser.add_argument("--fpr", type=float, default=0.05,
+                        help="human FPR of the threshold: flagged share, and the fixed log density of item 4")
     parser.add_argument("--bands", type=int, default=8, help="equal-size groups of PCs for band/k")
     parser.add_argument("--bootstrap", type=int, default=1000, help="paired resamples for the Δ intervals")
     parser.add_argument("--seed", type=int, default=0)
@@ -241,19 +259,55 @@ def geometric_mean_per_unit(units: np.ndarray, tau2: np.ndarray) -> tuple[np.nda
 # --------------------------------------------------------------------------
 
 
-def detection(rows: list[dict], scores: np.ndarray, generators: list[str], pools: dict[str, list[str]]
-              ) -> tuple[dict, dict]:
-    """AUROCs (song = min over windows) per generator and pool, window AUROC, flagged @ 5 %."""
+def detection(rows: list[dict], scores: np.ndarray, generators: list[str], pools: dict[str, list[str]],
+              fpr: float) -> tuple[dict, dict]:
+    """AUROCs (song = min over windows) per generator and pool, window AUROC, flagged at `fpr`."""
     table = emp.song_scores(rows, scores, set())
     human = table[em.HUMAN]["min"]
     out: dict[str, float] = {g: em.auroc(human, table[g]["min"]) for g in generators}
     for name, members in pools.items():
         out[name] = em.auroc(human, np.concatenate([table[g]["min"] for g in members]))
-    synthetic = np.concatenate([table[g]["min"] for g in generators])
-    out["flagged"] = float(np.mean(synthetic < np.quantile(human, 0.05)))
+    out["flagged"] = tpr_at_fpr(table, generators, fpr)
     sources = np.array([row["source"] for row in rows])
     out["window"] = em.auroc(scores[sources == em.HUMAN], scores[np.isin(sources, generators)])
     return out, table
+
+
+def log_det_standardization(model) -> float:
+    """-Σ log feat_std.
+
+    Added to the Gaussian's log p of the standardized features z, it gives the
+    log density of the mix itself. The mix is the same space for every refit,
+    so the same value means the same density in all of them.
+    """
+    return -float(model.feat_std.double().log().sum())
+
+
+def share_below(table: dict, sources: list[str], threshold: float) -> float:
+    """Share of the songs of `sources` whose score (min over windows) is below `threshold`."""
+    return float(np.mean(np.concatenate([table[s]["min"] for s in sources]) < threshold))
+
+
+def tpr_at_fpr(table: dict, generators: list[str], fpr: float) -> float:
+    return share_below(table, generators, float(np.quantile(table[em.HUMAN]["min"], fpr)))
+
+
+def fixed_threshold(base: dict, table: dict, base_offset: float, offset: float,
+                    pools: dict[str, list[str]], fpr: float) -> dict:
+    """The refit at the untrimmed refit's log-density threshold, against the untrimmed one at the same FPR."""
+    threshold = float(np.quantile(base[em.HUMAN]["min"], fpr))  # untrimmed refit, units of its z
+    moved = threshold + base_offset - offset  # the same log density, in the refit's units
+    human_fpr = share_below(table, [em.HUMAN], moved)
+    flagged_now = table[em.HUMAN]["min"] < moved
+    flagged_before = base[em.HUMAN]["min"] < threshold
+    songs = table[em.HUMAN]["songs"]
+    return {
+        "fpr": human_fpr,
+        "tpr": {name: share_below(table, pool, moved) for name, pool in pools.items()},
+        "untrimmed_tpr_same_fpr": {name: tpr_at_fpr(base, pool, human_fpr) for name, pool in pools.items()},
+        "newly_flagged_human": [s for s, a, b in zip(songs, flagged_now, flagged_before) if a and not b],
+        "no_longer_flagged_human": [s for s, a, b in zip(songs, flagged_now, flagged_before) if b and not a],
+    }
 
 
 def unit_members(units: list[str]) -> list[np.ndarray]:
@@ -383,8 +437,10 @@ def main() -> None:
     mean_all, cov_all = moments(z, keep_all)
     refit(scratch, model, mean_all, cov_all, shrinkage)
     base_scores = eval_logp(cache, scratch, args.batch_size)
-    base, base_table = detection(rows, base_scores, generators, pools)
-    ckpt, _ = detection(rows, ckpt_logp, generators, pools)
+    base_offset = log_det_standardization(scratch)
+    base, base_table = detection(rows, base_scores, generators, pools, args.fpr)
+    ckpt, _ = detection(rows, ckpt_logp, generators, pools, args.fpr)
+    curve = {f: {name: tpr_at_fpr(base_table, pool, f) for name, pool in pools.items()} for f in CURVE}
     drift = float(np.abs(base_scores - ckpt_logp).max())
     print(f"check: refit on all windows vs. the checkpoint's Gaussian: max |Δ log p| = {drift:.3g} nats, "
           f"AUROC all {base['all']:.4f} vs. {ckpt['all']:.4f}")
@@ -412,7 +468,8 @@ def main() -> None:
             mean_k, cov_k = moments(z, keep)
             refit(scratch, model, mean_k, cov_k, shrinkage)
             scores = eval_logp(cache, scratch, args.batch_size)
-            metrics, table = detection(rows, scores, generators, pools)
+            offset = log_det_standardization(scratch)
+            metrics, table = detection(rows, scores, generators, pools, args.fpr)
             above = (eval_tau2[human] > t) if level == "window" else (human_song_tau2 > t)
             configs.append({
                 "level": level, "threshold": t,
@@ -423,6 +480,7 @@ def main() -> None:
                 "held_out_above": float(above.mean()),
                 "auroc": metrics,
                 "delta_ci95": paired_delta(base_table, table, members, pools, args.bootstrap, args.seed),
+                "fixed_threshold": fixed_threshold(base_table, table, base_offset, offset, pools, args.fpr),
             })
             del keep, mean_k, cov_k
 
@@ -446,7 +504,7 @@ def main() -> None:
     cols = generators + list(pools)
     header = [f"{g}*" if g in pools.get("dev", []) else g for g in generators] + list(pools)
     print("* = dev generator. window = pooled window-level AUROC; flagged = synthetic songs below the "
-          "5 % human quantile")
+          f"{args.fpr:.0%} human quantile")
     print(f"{'trim':<16}" + "".join(f"{h:>11}" for h in header) + f"{'window':>9}{'flagged':>9}")
     print(f"{'checkpoint':<16}" + "".join(f"{ckpt[c]:>11.3f}" for c in cols)
           + f"{ckpt['window']:>9.3f}{ckpt['flagged']:>9.3f}")
@@ -464,6 +522,22 @@ def main() -> None:
             cells.append(f"{c['auroc'][name] - base[name]:+.3f} [{lo:+.3f},{hi:+.3f}]".rjust(26))
         print(f"{label(c):<16}" + "".join(cells))
 
+    print("\n=== Operating points: synthetic songs flagged (TPR) against human songs flagged (FPR) ===")
+    print("untrimmed refit, by moving its threshold (no trim): "
+          + "; ".join(f"FPR {f:.0%} → TPR " + ", ".join(f"{name} {v:.3f}" for name, v in tprs.items())
+                      for f, tprs in curve.items()))
+    print(f"each trim at the untrimmed refit's {args.fpr:.0%}-FPR threshold, kept as a fixed log density of the "
+          "mix. 'same FPR' = the untrimmed refit's TPR at the FPR the trim reaches; equal = the trim only "
+          "moved the threshold")
+    print(f"{'trim':<16}{'human FPR':>10}" + "".join(f"{'TPR ' + name:>12}{'same FPR':>10}" for name in pools)
+          + f"{'human songs newly / no longer flagged':>40}")
+    for c in configs[1:]:
+        f = c["fixed_threshold"]
+        print(f"{label(c):<16}{f['fpr']:>10.3f}"
+              + "".join(f"{f['tpr'][name]:>12.3f}{f['untrimmed_tpr_same_fpr'][name]:>10.3f}" for name in pools)
+              + f"{len(f['newly_flagged_human']):>32} / {len(f['no_longer_flagged_human'])}")
+    print("(the newly flagged human keys are in the JSON; their titles and links in listen_tails.py's recordings.csv)")
+
     report = {
         "checkpoint": str(args.checkpoint), "arm": checkpoint.get("arm"), "epoch": checkpoint.get("epoch"),
         "train_cache": str(train_root), "eval_cache": str(eval_root), "human_split": split,
@@ -473,6 +547,7 @@ def main() -> None:
                   "recording_tau2_quantiles": {str(p): float(np.quantile(rec_tau2, p)) for p in QUANTILES}},
         "held_out_human": {"windows": int(human.sum()), "mean_q": float(q_eval[human].mean())},
         "check": {"max_abs_logp": drift, "checkpoint_auroc": ckpt},
+        "fpr": args.fpr, "untrimmed_curve": {str(f): tprs for f, tprs in curve.items()},
         "bands": band_names, "bootstrap": args.bootstrap, "seed": args.seed,
         "configs": configs,
     }
