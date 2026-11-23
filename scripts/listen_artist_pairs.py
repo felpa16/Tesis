@@ -34,9 +34,20 @@ Then:
 prints the share judged same-style (y = 1, p = 0.5, n = 0) for positives and
 controls, overall and by relation (same_album, within_year).
 
+--add-controls K appends K more control pairs to the folder in --out, numbered
+after the last pair, so a session can be balanced after judging (e.g. 40
+positives and 14 controls, plus 26 controls). The new pairs are not shuffled
+in, so the listener knows they are controls. They use no recording that is
+already in the folder. pairs.csv is rewritten with the existing verdicts kept
+and blank rows added, and the script refuses to run if pairs.csv has no
+verdicts at all: that is the unjudged copy, and syncing it back would
+overwrite the judged one. The old pairs.csv and key.csv are kept as
+*.before_add.csv.
+
 Examples:
     python scripts/listen_artist_pairs.py --data-root $DATA --audio-s3 $AUDIO_S3
     python scripts/listen_artist_pairs.py --n 30 --controls 10 --relation same_album
+    python scripts/listen_artist_pairs.py --add-controls 26 --audio-s3 $AUDIO_S3
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -117,12 +129,16 @@ def choose_positives(
     return chosen
 
 
-def choose_controls(pairs: list[dict], n: int, rng: random.Random) -> list[dict]:
+def choose_controls(
+    pairs: list[dict], n: int, rng: random.Random, exclude: set[str] | None = None
+) -> list[dict]:
     """n random pairs of recordings by different performers, of different works.
 
     Drawn from the recordings that appear in the positives' pool, so controls
     and positives come from the same population of performers and eras.
+    Recordings whose key is in `exclude` are never drawn.
     """
+    exclude = exclude or set()
     pool: dict[str, dict] = {}
     for p in pairs:
         for side in ("a", "b"):
@@ -132,7 +148,9 @@ def choose_controls(pairs: list[dict], n: int, rng: random.Random) -> list[dict]
                 "date": p[f"date_{side}"], "album": p[f"album_{side}"],
                 "performer": p["performer"],
             }
-    recordings = sorted(pool.values(), key=lambda r: r["key"])
+    recordings = sorted(
+        (r for r in pool.values() if r["key"] not in exclude), key=lambda r: r["key"]
+    )
     if len({r["performer"] for r in recordings}) < 2:
         return []
     controls = []
@@ -266,6 +284,123 @@ def score(directory: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# Writing a folder
+# --------------------------------------------------------------------------
+
+PAIRS_COLUMNS = ["pair", "file_ab", "same_style", "notes"]
+KEY_COLUMNS = ["pair", "relation", "performer", "key_a", "start_a", "key_b", "start_b",
+               "artist_a", "title_a", "work_a", "date_a", "album_a",
+               "artist_b", "title_b", "work_b", "date_b", "album_b",
+               "max_gap_days", "url_a", "url_b"]
+
+
+def render(chosen: list[dict], first: int, args: argparse.Namespace,
+           config: WindowConfig, rng: random.Random) -> list[dict]:
+    """pair_XX_{A,B,AB}.wav for each pair, numbered from `first`; one key row each."""
+    paths = audio_paths(args.data_root, args.split)
+    for p in chosen:
+        for key in (p["key_a"], p["key_b"]):
+            paths.setdefault(key, f"audio/{args.split}/{key}.webm")
+    videos = {t.key: t.youtube_id for t in split_tracks(args.split)}
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    audio = AudioSource(args.data_root, paths, args.audio_s3, args.out / "audio")
+    gap = np.zeros(round(args.gap_seconds * config.sample_rate), dtype=np.float32)
+    rows = []
+    for i, p in enumerate(chosen, start=first):
+        stem = f"pair_{i:02d}"
+        row = dict(p, pair=i, file_ab=f"{stem}_AB.wav")
+        waves = []
+        for side in ("a", "b"):
+            key = p[f"key_{side}"]
+            path = audio.path(key)
+            duration = probe_duration(path)
+            start = middle_start(duration, config.window_seconds, rng)
+            wave = decode_window(path, start, config).numpy()
+            write_wav(args.out / f"{stem}_{side.upper()}.wav", wave, config.sample_rate)
+            waves.append(wave)
+            row |= {
+                f"start_{side}": start,
+                f"file_{side}": f"{stem}_{side.upper()}.wav",
+                f"url_{side}": YOUTUBE_URL.format(video_id=videos.get(key, "")),
+            }
+        write_wav(args.out / f"{stem}_AB.wav", np.concatenate([waves[0], gap, waves[1]]),
+                  config.sample_rate)
+        rows.append(row)
+        print(f"{stem}  {p['key_a']}@{_clock(row['start_a'])}  "
+              f"{p['key_b']}@{_clock(row['start_b'])}")
+    return rows
+
+
+def write_tables(out: Path, rows: list[dict], judged: dict[int, dict] | None = None) -> None:
+    """pairs.csv, key.csv and index.html for `rows`.
+
+    `judged` maps pair -> its existing pairs.csv row; its same_style and notes
+    are kept, and every other pair gets blank ones.
+    """
+    judged = judged or {}
+    with open(out / "pairs.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PAIRS_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            old = judged.get(r["pair"], {})
+            writer.writerow({**r, "same_style": old.get("same_style", ""),
+                             "notes": old.get("notes", "")})
+    with open(out / "key.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=KEY_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    write_index(out, rows)
+
+
+def read_folder(out: Path) -> tuple[list[dict], dict[int, dict]]:
+    """An existing folder's key rows, in the form write_index takes, and its pairs.csv rows."""
+    rows = []
+    with open(out / "key.csv", newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            stem = f"pair_{int(r['pair']):02d}"
+            rows.append(r | {
+                "pair": int(r["pair"]),
+                "start_a": float(r["start_a"]), "start_b": float(r["start_b"]),
+                "file_a": f"{stem}_A.wav", "file_b": f"{stem}_B.wav",
+                "file_ab": f"{stem}_AB.wav",
+            })
+    with open(out / "pairs.csv", newline="", encoding="utf-8-sig") as f:
+        judged = {int(r["pair"]): r for r in csv.DictReader(f)}
+    return rows, judged
+
+
+def add_controls(args: argparse.Namespace, config: WindowConfig, pairs: list[dict]) -> None:
+    """Append --add-controls control pairs to the judged folder in --out."""
+    if not (args.out / "key.csv").exists():
+        raise SystemExit(f"no listening folder at {args.out}/ (no key.csv)")
+    rows, judged = read_folder(args.out)
+    if not any(r.get("same_style", "").strip() for r in judged.values()):
+        raise SystemExit(
+            f"{args.out}/pairs.csv has no verdicts. Copy the judged pairs.csv into "
+            f"{args.out}/ first: the rewritten file is the one you sync back, so it "
+            "must carry your labels."
+        )
+    used = {r[f"key_{side}"] for r in rows for side in ("a", "b")}
+    first = max(r["pair"] for r in rows) + 1
+    # a stream of its own, so a rerun draws the same pairs and windows again
+    rng = random.Random(args.seed + first)
+    controls = choose_controls(pairs, args.add_controls, rng, exclude=used)
+    if len(controls) < args.add_controls:
+        print(f"warning: found only {len(controls)} new control pairs")
+    for name in ("pairs", "key"):
+        shutil.copy2(args.out / f"{name}.csv", args.out / f"{name}.before_add.csv")
+
+    new = render(controls, first, args, config, rng)
+    write_tables(args.out, rows + new, judged)
+    n_controls = sum(r["relation"] == "control" for r in rows + new)
+    print(f"added pairs {first}-{first + len(new) - 1} ({len(new)} controls) to "
+          f"{args.out}/: {len(rows) + len(new)} pairs, {n_controls} of them controls. "
+          f"Kept {sum(bool(r.get('same_style', '').strip()) for r in judged.values())} "
+          f"verdicts; the old tables are *.before_add.csv")
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -291,15 +426,22 @@ def main() -> None:
                         help="s3://BUCKET/PREFIX holding {split}/ audio, for missing tracks")
     parser.add_argument("--gap-seconds", type=float, default=1.5)
     parser.add_argument("--out", type=Path, default=Path("listen_artist_pairs"))
+    parser.add_argument("--add-controls", type=int, default=0, metavar="K",
+                        help="append K control pairs to the judged folder in --out "
+                             "instead of writing a new one")
     args = parser.parse_args()
 
     if args.score is not None:
         score(args.score)
         return
 
-    rng = random.Random(args.seed)
     config = WindowConfig(window_seconds=args.window_seconds)
     pairs = read_pairs(args.pairs or DEFAULT_DATA_ROOT / "artist_pairs" / f"{args.split}.jsonl")
+    if args.add_controls:
+        add_controls(args, config, pairs)
+        return
+
+    rng = random.Random(args.seed)
     positives = choose_positives(pairs, args.n, args.relation, rng)
     n_controls = round(len(positives) / 3) if args.controls is None else args.controls
     controls = choose_controls(pairs, n_controls, rng)
@@ -308,53 +450,8 @@ def main() -> None:
     print(f"{len(pairs)} mined pairs; writing {len(positives)} positives and "
           f"{len(controls)} controls, shuffled")
 
-    paths = audio_paths(args.data_root, args.split)
-    for p in chosen:
-        for key in (p["key_a"], p["key_b"]):
-            paths.setdefault(key, f"audio/{args.split}/{key}.webm")
-    videos = {t.key: t.youtube_id for t in split_tracks(args.split)}
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    audio = AudioSource(args.data_root, paths, args.audio_s3, args.out / "audio")
-    gap = np.zeros(round(args.gap_seconds * config.sample_rate), dtype=np.float32)
-    rows = []
-    for i, p in enumerate(chosen, start=1):
-        stem = f"pair_{i:02d}"
-        row = dict(p, pair=i, file_ab=f"{stem}_AB.wav")
-        waves = []
-        for side in ("a", "b"):
-            key = p[f"key_{side}"]
-            path = audio.path(key)
-            duration = probe_duration(path)
-            start = middle_start(duration, config.window_seconds, rng)
-            wave = decode_window(path, start, config).numpy()
-            write_wav(args.out / f"{stem}_{side.upper()}.wav", wave, config.sample_rate)
-            waves.append(wave)
-            row |= {
-                f"start_{side}": start,
-                f"file_{side}": f"{stem}_{side.upper()}.wav",
-                f"url_{side}": YOUTUBE_URL.format(video_id=videos.get(key, "")),
-            }
-        write_wav(args.out / f"{stem}_AB.wav", np.concatenate([waves[0], gap, waves[1]]),
-                  config.sample_rate)
-        rows.append(row)
-        print(f"{stem}  {p['key_a']}@{_clock(row['start_a'])}  "
-              f"{p['key_b']}@{_clock(row['start_b'])}")
-
-    with open(args.out / "pairs.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["pair", "file_ab", "same_style", "notes"],
-                                extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows({**r, "same_style": "", "notes": ""} for r in rows)
-    key_columns = ["pair", "relation", "performer", "key_a", "start_a", "key_b", "start_b",
-                   "artist_a", "title_a", "work_a", "date_a", "album_a",
-                   "artist_b", "title_b", "work_b", "date_b", "album_b",
-                   "max_gap_days", "url_a", "url_b"]
-    with open(args.out / "key.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=key_columns, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    write_index(args.out, rows)
+    rows = render(chosen, 1, args, config, rng)
+    write_tables(args.out, rows)
     print(f"wrote {len(rows)} pairs to {args.out}/ -- open {args.out}/index.html, fill "
           f"pairs.csv, then: python scripts/listen_artist_pairs.py --score {args.out}")
 
